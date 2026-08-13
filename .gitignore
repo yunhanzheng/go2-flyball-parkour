@@ -1,0 +1,28 @@
+# Isaac Gym is installed alongside this repo, never committed into it.
+isaacgym*
+
+# Python / editor
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Training output. The two released checkpoints ship in the layout train.py
+# writes (<legged_gym>/logs/<proj_name>/<exptid>/), so they are un-ignored
+# level by level -- every other run directory stays ignored.
+logs/
+!legged_gym/logs/
+legged_gym/logs/*
+!legged_gym/logs/extreme-parkour/
+legged_gym/logs/extreme-parkour/*
+!legged_gym/logs/extreme-parkour/teacher/
+!legged_gym/logs/extreme-parkour/student/
+!legged_gym/logs/extreme-parkour/flat_baseline/
+wandb/
+
+# Generated at runtime
+legged_gym/legged_gym/scripts/terrain_mesh.npz
+# play.py --show_cam: URDF copy with the D435i housing, regenerated each run
+*_show_cam.urdf

@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <style>
+        html, body {
+            width: 100%; height: 100%;
+            margin: 0; overflow: hidden; display: block;
+            background-color: #000;
+        }
+    </style>
+</head>
+<body>
+    <div>
+        <canvas id="canvas" tabindex='1'></canvas>
+    </div>
+    <script>
+        var canvas, context, image, imageDepth, imagePlot, imageRew;
+        var showDepth = true; // will auto-disable if depth stream doesn't load
+
+        function sendInputRequest(data){
+            let req = new XMLHttpRequest();
+            req.open("POST", "{{ url_for('_route_input_event') }}", true);
+            req.setRequestHeader("Content-Type", "application/json");
+            req.send(JSON.stringify(data));
+        }
+
+        function draw(){
+            // wait until main stream has real dimensions
+            if (!image || image.naturalWidth === 0 || image.naturalHeight === 0) return;
+
+            // If neither --plot nor --rew streams are alive, give the camera
+            // the full canvas width. Otherwise split 30/70.
+            const havePlot = imagePlot && imagePlot.naturalWidth > 0 && imagePlot.naturalHeight > 0;
+            const haveRew  = imageRew  && imageRew.naturalWidth  > 0 && imageRew.naturalHeight  > 0;
+            const haveRight = havePlot || haveRew;
+            const camFrac = haveRight ? 0.3 : 1.0;
+            const camW = Math.floor(canvas.width * camFrac);
+            const plotX = camW;
+            const plotW = canvas.width - camW;
+
+            const ratio = image.naturalWidth / image.naturalHeight;
+            const mainH = camW / ratio;
+
+            // clear
+            context.clearRect(0, 0, canvas.width, canvas.height);
+
+            // draw RGB (left column)
+            context.drawImage(image, 0, 0, camW, mainH);
+
+            // draw depth below RGB (left column, if available)
+            if (showDepth && imageDepth && imageDepth.naturalWidth > 0 && imageDepth.naturalHeight > 0) {
+                const depthRatio = imageDepth.naturalWidth / imageDepth.naturalHeight;
+                const depthH = camW / depthRatio;
+                context.drawImage(imageDepth, 0, mainH, camW, depthH);
+            }
+
+            // draw force plot (right column, top)
+            let plotBottomY = 0;
+            if (imagePlot && imagePlot.naturalWidth > 0 && imagePlot.naturalHeight > 0) {
+                const plotRatio = imagePlot.naturalWidth / imagePlot.naturalHeight;
+                const plotH = plotW / plotRatio;
+                context.drawImage(imagePlot, plotX, 0, plotW, plotH);
+                plotBottomY = plotH;
+            }
+
+            // draw reward dashboard (right column, below force plot)
+            if (imageRew && imageRew.naturalWidth > 0 && imageRew.naturalHeight > 0) {
+                const rewRatio = imageRew.naturalWidth / imageRew.naturalHeight;
+                const rewH = plotW / rewRatio;
+                context.drawImage(imageRew, plotX, plotBottomY, plotW, rewH);
+            }
+        }
+
+        window.onload = function(){
+            canvas = document.getElementById("canvas");
+            context = canvas.getContext("2d");
+
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+
+            window.addEventListener("resize", function(){
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            }, false);
+
+            // main MJPEG stream
+            image = new Image();
+            image.src = "{{ url_for('_route_stream') }}";
+
+            // depth MJPEG stream (optional)
+            imageDepth = new Image();
+            imageDepth.onload = () => { showDepth = true; };
+            imageDepth.onerror = () => { showDepth = false; }; // disable if endpoint doesn't stream
+            imageDepth.src = "{{ url_for('_route_stream_depth') }}";
+
+            // force plot stream
+            imagePlot = new Image();
+            imagePlot.src = "{{ url_for('_route_stream_plot') }}";
+
+            // reward dashboard stream
+            imageRew = new Image();
+            imageRew.src = "{{ url_for('_route_stream_rew') }}";
+
+            // ~20 FPS for 50
+            window.setInterval(draw, 60);
+
+            // key input
+            canvas.addEventListener("keydown", function(event){
+            if(event.keyCode !== 18) sendInputRequest({key: event.keyCode});
+            }, false);
+
+            // mouse move
+            canvas.addEventListener("mousemove", function(event){
+            if(event.buttons){
+                let data = {dx: event.movementX, dy: event.movementY};
+                if(event.altKey && event.buttons === 1){
+                data.key = 18;
+                data.mouse = "left";
+                } else if(event.buttons === 2) {
+                data.mouse = "right";
+                } else if(event.buttons === 4) {
+                data.mouse = "middle";
+                } else {
+                return;
+                }
+                sendInputRequest(data);
+            }
+            }, false);
+
+            // wheel
+            canvas.addEventListener("wheel", function(event){
+            sendInputRequest({mouse: "wheel", dz: Math.sign(event.deltaY)});
+            }, false);
+
+            // IMPORTANT: focus canvas so it receives key events
+            canvas.focus();
+        }
+        </script>
+</body>
+</html>

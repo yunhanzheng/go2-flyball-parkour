@@ -1,0 +1,31 @@
+# Isaac Gym and PyTorch are installed separately -- see README.md.
+# Everything below is imported by the environment, the terrain builder or the
+# training/play scripts.
+
+# terrain meshing (terrain.py, flyball_wall.py)
+pydelatin
+pyfqmr
+pyvista
+scipy
+
+# depth camera (warp_cam.py)
+warp-lang
+
+# observation / image processing
+numpy<1.24
+opencv-python
+
+# training loop and logging
+tensorboard
+wandb
+tqdm
+matplotlib
+
+# play.py --video and the browser viewer (webviewer.py)
+imageio
+flask
+
+setuptools==59.5.0
+
+# tests
+pytest
