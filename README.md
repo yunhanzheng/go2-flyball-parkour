@@ -83,9 +83,17 @@ python play.py --exptid teacher --checkpoint 3200 --device cuda:0
 # depth-camera student
 python play.py --exptid student --task go2_student --checkpoint 10000 \
     --use_camera --delay --device cuda:0
+
+# flat-terrain base policy
+python play.py --exptid flat_baseline --checkpoint 2400 \
+    --terrain_only parkour_flat --device cuda:0
 ```
 
-Replay flags: `--video`, `--web`, `--level N`, `--no-dr`, `--all_rough` (every tile on the
+Play runs without domain randomization by default; pass `--full-dr` to replay with the
+training DR. Video and `--web` replays are pinned to terrain level 8 unless `--level N` or
+`--max_level` is given.
+
+Replay flags: `--video`, `--web`, `--level N`, `--full-dr`, `--all_rough` (every tile on the
 rough curriculum), `--overlays` (foothold goals and hurdle-clearance volumes),
 `--vel_profile 'vel:secs,...'`.
 

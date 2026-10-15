@@ -1085,8 +1085,8 @@ def play(args):
         _src = 'CLI override' if (args.self_geom or args.no_self_geom) else f'{args.task} config'
         print(f"[depth] self-geometry {'ON' if _sg else 'OFF'} ({_src}) — must match how "
               f"'{args.exptid}' was distilled, or the student sees an unfamiliar depth image")
-    # By DEFAULT play.py mirrors the task's training DR as the config resolved it. One
-    # gap: the env flattens per-env action latency under a GUI viewer, unless --full-dr.
+    # By DEFAULT play.py runs with DR off (--no-dr is implied unless --full-dr is given).
+    # --full-dr mirrors the task's training DR, including per-env action latency under a viewer.
     if getattr(args, "no_dr", False):
         # Every DR term is flag-gated: clearing randomize_* + pushes + noise is enough.
         dr = env_cfg.domain_rand
@@ -1914,5 +1914,13 @@ if __name__ == '__main__':
         args.data = True
     if not _given('--max_steps'):
         args.max_steps = 600
+    if (not _given('--level') and not args.max_level and (args.video or args.web)):
+        # Visual replays pin level 8; the headless --no_video analysis keeps its
+        # all-level sweep (a pinned --level would collapse it to one row).
+        args.level = 8
+    if not args.full_dr:
+        # Clean dynamics by default: with 1 env a single extreme mass/CoM draw can
+        # topple an otherwise sound policy. --full-dr restores the training DR.
+        args.no_dr = True
 
     play(args)
