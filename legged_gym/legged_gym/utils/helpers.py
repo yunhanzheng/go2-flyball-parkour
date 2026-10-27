@@ -237,6 +237,25 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             cfg_train.depth_encoder.if_depth = args.use_camera
         if args.max_iterations is not None:
             cfg_train.runner.max_iterations = args.max_iterations
+        if getattr(args, "learning_rate", None) is not None:
+            cfg_train.algorithm.learning_rate = args.learning_rate
+            print(f"[train] --learning_rate: policy lr {args.learning_rate:.2e} "
+                  f"(encoder lr stays depth_encoder.learning_rate "
+                  f"{cfg_train.depth_encoder.learning_rate:.2e}; the KL schedule "
+                  f"rescales both proportionally)")
+        if getattr(args, "num_learning_epochs", None) is not None:
+            cfg_train.algorithm.num_learning_epochs = args.num_learning_epochs
+            print(f"[train] --num_learning_epochs: {args.num_learning_epochs}")
+        if getattr(args, "num_mini_batches", None) is not None:
+            cfg_train.algorithm.num_mini_batches = args.num_mini_batches
+            print(f"[train] --num_mini_batches: {args.num_mini_batches}")
+        if getattr(args, "schedule", None) is not None:
+            _schedule = str(args.schedule).lower()
+            if _schedule not in ("adaptive", "fixed"):
+                raise SystemExit(f"[train] --schedule must be 'adaptive' or 'fixed', got "
+                                 f"'{args.schedule}'")
+            cfg_train.algorithm.schedule = _schedule
+            print(f"[train] --schedule: {_schedule}")
         if getattr(args, "lr_floor", None) is not None:
             cfg_train.algorithm.min_learning_rate = args.lr_floor
             print(f"[train] --lr_floor: adaptive-LR floor {args.lr_floor:.2e} "
@@ -278,6 +297,10 @@ def get_args():
         {"name": "--cold_start", "action": "store_true", "default": False, "help": "Start every curriculum environment at terrain row 0."},
         {"name": "--seed", "type": int, "help": "Random seed. Overrides config file if provided."},
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
+        {"name": "--learning_rate", "type": float, "default": None, "help": "Policy learning rate (algorithm.learning_rate). depth_encoder.learning_rate is kept as-is — it is a separate parameter group, and the adaptive schedule rescales both proportionally."},
+        {"name": "--num_learning_epochs", "type": int, "default": None, "help": "algorithm.num_learning_epochs. On the go2_depth path every epoch replays the depth encoder over the rollout, so this is the main throughput knob."},
+        {"name": "--num_mini_batches", "type": int, "default": None, "help": "algorithm.num_mini_batches. Together with --num_learning_epochs it sets how many CNN replays PPO.update does per iteration."},
+        {"name": "--schedule", "type": str, "default": None, "help": "algorithm.schedule: 'adaptive' (default) or 'fixed'. The adaptive controller checks KL PER MINIBATCH and pins the lr at --lr_floor once the depth latent starts drifting, so 'fixed' is the escape hatch when learning stalls."},
         {"name": "--lr_floor", "type": float, "default": None, "help": "Lower clamp of the KL-adaptive learning rate (algorithm.min_learning_rate, default 1e-5). The per-minibatch KL schedule saturates at this floor on warm resumes, so this is effectively the post-saturation lr."},
         {"name": "--device", "type": str, "default": "cuda:0", "help": 'Device for sim, rl, and graphics'},
 
