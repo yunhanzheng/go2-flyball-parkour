@@ -283,15 +283,18 @@ class ActorCriticRMA(nn.Module):
     def entropy(self):
         return self.distribution.entropy().sum(dim=-1)
 
-    def update_distribution(self, observations, hist_encoding):
-        mean = self.actor(observations, hist_encoding)
+    def update_distribution(self, observations, hist_encoding, scandots_latent=None):
+        # `scandots_latent` overrides the scan-encoder output, which is what lets the
+        # SAME actor be driven by the depth encoder's latent instead of the height scan
+        # (single-stage depth PPO). None keeps the privileged scan path untouched.
+        mean = self.actor(observations, hist_encoding, scandots_latent=scandots_latent)
         if self.max_noise_std is not None:
             with torch.no_grad():
                 self.std.data.clamp_(max=self.max_noise_std)
         self.distribution = Normal(mean, mean*0. + self.std)
 
-    def act(self, observations, hist_encoding=False, **kwargs):
-        self.update_distribution(observations, hist_encoding)
+    def act(self, observations, hist_encoding=False, scandots_latent=None, **kwargs):
+        self.update_distribution(observations, hist_encoding, scandots_latent)
         return self.distribution.sample()
     
     def get_actions_log_prob(self, actions):

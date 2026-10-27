@@ -46,6 +46,12 @@ class RolloutStorage:
             self.action_mean = None
             self.action_sigma = None
             self.hidden_states = None
+            # Depth PPO only: the camera frame the encoder consumed on this step and
+            # the GRU state the encoder had BEFORE consuming it. Both are filled on
+            # every transition (the 10 Hz tick pair is reused between ticks), so
+            # update() can replay the exact same encoder call per sample.
+            self.depth = None
+            self.depth_hidden = None
         def clear(self):
             self.__init__()
 
@@ -83,6 +89,10 @@ class RolloutStorage:
         self.saved_hidden_states_a = None
         self.saved_hidden_states_c = None
 
+        # depth PPO (allocated lazily on the first add_transitions that carries a frame)
+        self.depth = None
+        self.depth_hidden = None
+
         self.step = 0
 
     def add_transitions(self, transition: Transition):
@@ -99,7 +109,30 @@ class RolloutStorage:
         self.sigma[self.step].copy_(transition.action_sigma)
 
         self._save_hidden_states(transition.hidden_states)
+        self._save_depth(transition.depth, transition.depth_hidden)
         self.step += 1
+
+    def _save_depth(self, depth, depth_hidden):
+        """Store one (frame, GRU-hidden-before) pair per transition.
+
+        Frames go in as fp16 (halves the buffer; the encoder runs in fp32 and the
+        generator casts back) and hidden states stay fp32 because they feed the GRU
+        directly. Allocation is forced OUT of inference mode: the rollout runs inside
+        torch.inference_mode(), and a tensor born there cannot later receive a
+        grad-requiring copy_ from update().
+        """
+        if depth is None:
+            return
+        if self.depth is None:
+            with torch.inference_mode(False):
+                self.depth = torch.zeros(self.observations.shape[0], *depth.shape,
+                                         dtype=torch.float16, device=self.device)
+                self.depth_hidden = torch.zeros(self.observations.shape[0],
+                                               depth_hidden.shape[0],
+                                               depth_hidden.shape[-1],
+                                               device=self.device)
+        self.depth[self.step].copy_(depth.to(torch.float16))
+        self.depth_hidden[self.step].copy_(depth_hidden)
 
     def _save_hidden_states(self, hidden_states):
         if hidden_states is None or hidden_states==(None, None):
@@ -171,6 +204,11 @@ class RolloutStorage:
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
 
+        # Depth PPO: (frame, hidden-before) per transition, fp16 -> fp32 for the CNN.
+        depth = self.depth.flatten(0, 1) if self.depth is not None else None
+        depth_hidden = (self.depth_hidden.flatten(0, 1)
+                        if self.depth_hidden is not None else None)
+
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
 
@@ -188,9 +226,17 @@ class RolloutStorage:
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
 
+                if depth is not None:
+                    depth_batch = depth[batch_idx].to(torch.float32)
+                    depth_hidden_batch = depth_hidden[batch_idx]
+                else:
+                    depth_batch = None
+                    depth_hidden_batch = None
+
                 
                 yield obs_batch, critic_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, \
-                       old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None
+                       old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None, \
+                       depth_batch, depth_hidden_batch
 
     # for RNNs only
     def reccurent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
@@ -239,7 +285,11 @@ class RolloutStorage:
                 hid_a_batch = hid_a_batch[0] if len(hid_a_batch)==1 else hid_a_batch
                 hid_c_batch = hid_c_batch[0] if len(hid_c_batch)==1 else hid_a_batch
 
+                # Depth is not supported on this (unused for ActorCriticRMA) recurrent
+                # path: it shuffles whole env trajectories, while the depth encoder is
+                # replayed per flattened sample time. Keep the tuple arity in sync.
                 yield obs_batch, critic_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, \
-                       old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (hid_a_batch, hid_c_batch), masks_batch
+                       old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (hid_a_batch, hid_c_batch), masks_batch, \
+                       None, None
                 
                 first_traj = last_traj

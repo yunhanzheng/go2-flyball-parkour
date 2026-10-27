@@ -138,12 +138,42 @@ class PPO:
 
         # Depth encoder
         self.if_depth = depth_encoder != None
+        # Single-stage "teacher + student merged": the depth encoder is a TRAINABLE part
+        # of the policy (PPO gradients through the actor + an auxiliary scan-latent
+        # regression), not a DAgger/frozen target. Off by default so the existing
+        # two-stage distillation path is unchanged byte for byte.
+        self.train_depth_ppo = bool(self.if_depth and depth_encoder_paras.get("train_with_ppo", False))
+        self.depth_aux_scan_coef = float(depth_encoder_paras.get("aux_scan_coef", 0.0))
+        # Deploy-side observation knobs, mirrored from the distillation runner: the
+        # camera policy must be optimised on the observation it will actually see.
+        self.zero_heading_obs = bool(depth_encoder_paras.get("zero_heading_obs", True))
+        self.zero_student_velocity_obs = bool(depth_encoder_paras.get("zero_student_velocity_obs", False))
+        # Encoder lr / policy lr, used to rescale the second param group whenever the
+        # KL-adaptive schedule moves the policy lr.
+        self.depth_encoder_lr_ratio = 1.0
+        self.last_depth_aux_loss = float('nan')
         if self.if_depth:
             self.depth_encoder = depth_encoder
             self.depth_encoder_optimizer = optim.Adam(self.depth_encoder.parameters(), lr=depth_encoder_paras["learning_rate"])
             self.depth_encoder_paras = depth_encoder_paras
-            self.depth_actor = depth_actor
-            self.depth_actor_optimizer = optim.Adam([*self.depth_actor.parameters(), *self.depth_encoder.parameters()], lr=depth_encoder_paras["learning_rate"])
+            if self.train_depth_ppo:
+                # The encoder joins the PPO optimizer as a SECOND parameter group with
+                # its own base lr. There is no separate depth actor: actor_critic.actor
+                # IS the depth actor (driven through scandots_latent), so nothing is
+                # cloned and nothing is distilled.
+                self.depth_encoder_lr_ratio = float(depth_encoder_paras["learning_rate"]) / float(learning_rate)
+                self.optimizer = optim.Adam([
+                    {'params': list(self.actor_critic.parameters()), 'lr': learning_rate},
+                    {'params': list(self.depth_encoder.parameters()),
+                     'lr': float(depth_encoder_paras["learning_rate"])},
+                ], lr=learning_rate)
+                self.depth_encoder_optimizer = self.optimizer
+                print(f"[ppo] depth PPO: encoder in the PPO optimizer (policy lr "
+                      f"{learning_rate:.1e}, encoder lr {depth_encoder_paras['learning_rate']:.1e}), "
+                      f"aux scan coef {self.depth_aux_scan_coef}")
+            else:
+                self.depth_actor = depth_actor
+                self.depth_actor_optimizer = optim.Adam([*self.depth_actor.parameters(), *self.depth_encoder.parameters()], lr=depth_encoder_paras["learning_rate"])
 
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
         self.storage = RolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape,  critic_obs_shape, action_shape, self.device)
@@ -154,17 +184,90 @@ class PPO:
     def train_mode(self):
         self.actor_critic.train()
 
-    def act(self, obs, critic_obs, info, hist_encoding=False):
+    def depth_actor_obs(self, obs):
+        """The observation the DEPLOYED depth actor sees.
+
+        Mirrors OnPolicyRunner._distillation_observations plus the heading blanking
+        that play.py applies before handing the frame to the encoder/actor:
+
+          * privileged explicit state -> the estimator's prediction (the robot has no
+            vicon, so the deploy policy must be trained on the estimate),
+          * obs[:, 6:8] -> 0, the two command slots the camera policy has to infer
+            (direction-to-goal) from depth instead of reading off the command vector.
+
+        Used for BOTH the rollout action and the PPO recompute, so the optimised
+        distribution is the one that will actually run on hardware.
+        """
+        out = obs.clone()
+        if self.train_with_estimated_states:
+            with torch.no_grad():
+                out[:, self.num_prop + self.num_scan:
+                       self.num_prop + self.num_scan + self.priv_states_dim] = \
+                    self.estimator(out[:, :self.num_prop])
+        if self.zero_student_velocity_obs:
+            velocity_dim = min(3, self.priv_states_dim)
+            out[:, self.num_prop + self.num_scan:
+                   self.num_prop + self.num_scan + velocity_dim] = 0.0
+        if self.zero_heading_obs:
+            out[:, 6:8] = 0.0
+        return out
+
+    def _depth_latent_batch(self, depth_batch, depth_hidden_batch, obs_batch):
+        """Replay the depth encoder for a minibatch at its ROLLOUT-time GRU state.
+
+        The rollout caches (frame, hidden-before) at every 10 Hz encoder tick and
+        reuses that pair on the intermediate 50 Hz steps, so replaying the pair
+        reproduces the depth latent the action was taken with (up to the weights that
+        have moved since) while keeping the encoder cadence identical to deployment.
+        Gradients flow through the CNN / combination MLP / output head; the recurrent
+        path is truncated at the stored state (BPTT length 1, as at rollout).
+
+        Returns (latent, aux_loss_or_None).
+        """
+        enc = self.depth_encoder
+        prop = obs_batch[:, :self.num_prop]
+        if self.zero_heading_obs:
+            prop = prop.clone()
+            prop[:, 6:8] = 0.0
+        prev_hidden = enc.hidden_states
+        enc.hidden_states = depth_hidden_batch.unsqueeze(0)
+        latent = enc(depth_batch, prop)
+        enc.hidden_states = prev_hidden
+
+        aux_loss = None
+        if self.depth_aux_scan_coef > 0.0 and self.actor_critic.actor.if_scan_encode:
+            # Target is the actor's OWN height-scan latent, stop-grad: this is not
+            # distillation of a teacher's actions, only a frame-of-reference anchor that
+            # keeps the camera bottleneck where the privileged actor expects it.
+            with torch.no_grad():
+                target = self.actor_critic.actor.infer_scandots_latent(obs_batch)
+            aux_loss = torch.nn.functional.mse_loss(
+                latent[:, :target.shape[1]], target)
+        return latent, aux_loss
+
+    def act(self, obs, critic_obs, info, hist_encoding=False, depth_latent=None,
+            depth_img=None, depth_hidden=None):
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
         # Compute the actions and values, use proprio to compute estimated priv_states then actions, but store true priv_states
-        if self.train_with_estimated_states:
+        if depth_latent is not None:
+            # Depth PPO: the actor is driven by the camera latent in place of the height
+            # scan, on the deployable observation built by depth_actor_obs().
+            self.transition.actions = self.actor_critic.act(
+                self.depth_actor_obs(obs), hist_encoding,
+                scandots_latent=depth_latent).detach()
+        elif self.train_with_estimated_states:
             obs_est = obs.clone()
             priv_states_estimated = self.estimator(obs_est[:, :self.num_prop])
             obs_est[:, self.num_prop+self.num_scan:self.num_prop+self.num_scan+self.priv_states_dim] = priv_states_estimated
             self.transition.actions = self.actor_critic.act(obs_est, hist_encoding).detach()
         else:
             self.transition.actions = self.actor_critic.act(obs, hist_encoding).detach()
+
+        # Recorded on EVERY transition (the tick pair is reused between ticks), so the
+        # storage carries one replayable encoder input per stored step.
+        self.transition.depth = depth_img
+        self.transition.depth_hidden = depth_hidden
 
         self.transition.values = self.actor_critic.evaluate(critic_obs).detach()
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
@@ -204,6 +307,7 @@ class PPO:
         mean_surrogate_loss = torch.zeros((), device=self.device)
         mean_estimator_loss = torch.zeros((), device=self.device)
         mean_priv_reg_loss = torch.zeros((), device=self.device)
+        mean_depth_aux_loss = torch.zeros((), device=self.device)
         mean_discriminator_loss = 0   # no per-minibatch value; stays Python 0
         mean_discriminator_acc = 0
         # Diagnostics for the KL-adaptive schedule (logged, not used for control):
@@ -216,9 +320,20 @@ class PPO:
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
-            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch in generator:
+            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, depth_batch, depth_hidden_batch in generator:
 
-                self.actor_critic.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0]) # match distribution dimension
+                depth_aux_loss = None
+                if depth_batch is not None:
+                    # Depth PPO: rebuild the camera latent from the cached
+                    # (frame, hidden-before) pair and feed it as the scan slot, so the
+                    # distribution being clipped is the deployed one. hist_encoding is
+                    # always on here — the deploy path has no privileged latent.
+                    depth_latent, depth_aux_loss = self._depth_latent_batch(
+                        depth_batch, depth_hidden_batch, obs_batch)
+                    self.actor_critic.act(self.depth_actor_obs(obs_batch), hist_encoding=True,
+                                          scandots_latent=depth_latent)
+                else:
+                    self.actor_critic.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0]) # match distribution dimension
 
                 actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
                 value_batch = self.actor_critic.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
@@ -265,7 +380,11 @@ class PPO:
                         lr_floor_hits += int(self.learning_rate <= self.min_learning_rate * 1.0001)
 
                         for param_group in self.optimizer.param_groups:
-                            param_group['lr'] = self.learning_rate
+                            # Group 0 is the policy, group 1 (depth PPO only) the encoder;
+                            # the encoder keeps its own lr scale relative to the policy.
+                            ratio = 1.0 if param_group is self.optimizer.param_groups[0] \
+                                else self.depth_encoder_lr_ratio
+                            param_group['lr'] = self.learning_rate * ratio
 
 
                 # Surrogate loss
@@ -289,12 +408,17 @@ class PPO:
                        self.value_loss_coef * value_loss - \
                        self.entropy_coef * entropy_batch.mean() + \
                        priv_reg_coef * priv_reg_loss
+                if depth_aux_loss is not None:
+                    loss = loss + self.depth_aux_scan_coef * depth_aux_loss
                 # loss = self.teacher_alpha * imitation_loss + (1 - self.teacher_alpha) * loss
 
                 # Gradient step
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+                # Both parameter groups (policy, and the encoder under depth PPO).
+                nn.utils.clip_grad_norm_(
+                    [p for group in self.optimizer.param_groups for p in group['params']],
+                    self.max_grad_norm)
                 self.optimizer.step()
 
                 # Detached GPU accumulation — no host sync inside the loop.
@@ -302,13 +426,19 @@ class PPO:
                 mean_surrogate_loss += surrogate_loss.detach()
                 mean_estimator_loss += estimator_loss.detach()
                 mean_priv_reg_loss += priv_reg_loss.detach()
+                if depth_aux_loss is not None:
+                    mean_depth_aux_loss = mean_depth_aux_loss + depth_aux_loss.detach()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         # Single host sync: stack the four GPU-accumulated means and pull them over in
         # one .tolist() (was four sequential .item() calls = four sync points).
-        mean_value_loss, mean_surrogate_loss, mean_estimator_loss, mean_priv_reg_loss = (
+        mean_value_loss, mean_surrogate_loss, mean_estimator_loss, mean_priv_reg_loss, mean_depth_aux_loss = (
             torch.stack([mean_value_loss, mean_surrogate_loss,
-                         mean_estimator_loss, mean_priv_reg_loss]) / num_updates).tolist()
+                         mean_estimator_loss, mean_priv_reg_loss,
+                         mean_depth_aux_loss]) / num_updates).tolist()
+        # Surfaced for the runner's log line (kept off the return tuple so the
+        # signature and every call site stay untouched).
+        self.last_depth_aux_loss = mean_depth_aux_loss
         mean_discriminator_loss /= num_updates
         mean_discriminator_acc /= num_updates
         # Read by the runner for logging (kept off the return tuple so the
@@ -326,7 +456,7 @@ class PPO:
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
-            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch in generator:
+            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, _depth_batch, _depth_hidden_batch in generator:
                 with torch.inference_mode():
                     self.actor_critic.act(obs_batch, hist_encoding=True, masks=masks_batch, hidden_states=hid_states_batch[0])
 

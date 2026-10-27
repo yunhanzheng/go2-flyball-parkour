@@ -33,6 +33,7 @@ from .base.legged_robot import LeggedRobot
 from .go2.go2_config import Go2RoughCfg, Go2RoughCfgPPO
 from .go2.go2_teacher_config import Go2TeacherCfg, Go2TeacherCfgPPO
 from .go2.go2_student_config import Go2StudentCfg, Go2StudentCfgPPO
+from .go2.go2_depth_config import Go2DepthCfg, Go2DepthCfgPPO
 
 import os
 
@@ -40,3 +41,4 @@ from legged_gym.utils.task_registry import task_registry
 
 task_registry.register( "go2_teacher", LeggedRobot, Go2TeacherCfg(), Go2TeacherCfgPPO() )
 task_registry.register( "go2_student",  LeggedRobot, Go2StudentCfg(),  Go2StudentCfgPPO() )
+task_registry.register( "go2_depth",    LeggedRobot, Go2DepthCfg(),    Go2DepthCfgPPO() )

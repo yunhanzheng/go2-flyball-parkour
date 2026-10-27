@@ -85,13 +85,22 @@ class OnPolicyRunner:
         # 2-D heading that is fed into the student's obs[:,6:8] and supervised
         # against the teacher's commanded heading. Off => zeroed heading slots.
         self.use_yaw = os.environ.get("EP_USE_YAW", "0") == "1"
+        # Single-stage depth PPO: the encoder is trained inside the RL loop and the
+        # actor is driven by its latent, so there is no separate depth actor to clone
+        # (see PPO.train_depth_ppo / learn_depth_ppo).
+        self.train_depth_ppo = bool(
+            self.if_depth and self.depth_encoder_cfg.get("train_with_ppo", False))
+        if self.train_depth_ppo and self.use_yaw:
+            raise ValueError(
+                "[runner] depth PPO cannot run with EP_USE_YAW=1: the encoder head then "
+                "emits 34 dims and cannot stand in for the 32-D scan latent.")
         if self.if_depth:
             depth_backbone = DepthOnlyFCBackbone58x87(env.cfg.env.n_proprio, 
                                                     self.policy_cfg["scan_encoder_dims"][-1], 
                                                     self.depth_encoder_cfg["hidden_dims"],
                                                     )
             depth_encoder = RecurrentDepthBackbone(depth_backbone, env.cfg).to(self.device)
-            depth_actor = deepcopy(actor_critic.actor)
+            depth_actor = None if self.train_depth_ppo else deepcopy(actor_critic.actor)
         else:
             depth_encoder = None
             depth_actor = None
@@ -118,7 +127,7 @@ class OnPolicyRunner:
         )
 
         if self.if_depth:
-            self.learn = self.learn_vision
+            self.learn = self.learn_depth_ppo if self.train_depth_ppo else self.learn_vision
         else:
             self.learn = self.learn_RL
             
@@ -276,6 +285,146 @@ class OnPolicyRunner:
             ep_infos.clear()
         
         # self.current_learning_iteration += num_learning_iterations
+        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+
+    def _depth_tick(self, obs, frame):
+        """One depth-encoder tick: 10 Hz, i.e. once per cfg.depth.update_interval steps.
+
+        Returns (latent, frame, hidden_before). The (frame, hidden-before) pair is what
+        every transition caches — the 50 Hz steps in between reuse the tick's latent,
+        exactly as play.py does — so PPO can replay the same encoder call per sample.
+        """
+        enc = self.alg.depth_encoder
+        if enc.hidden_states is None:
+            # GRU(x, None) is GRU(x, zeros); materialise it so the rollout can cache it.
+            enc.hidden_states = torch.zeros(1, self.env.num_envs, enc.rnn.hidden_size,
+                                            device=self.device)
+        hidden_before = enc.hidden_states[0].clone()
+        frame = frame.clone()
+        prop = obs[:, :self.env.cfg.env.n_proprio].clone()
+        prop[:, 6:8] = 0.0   # deploy blanks the heading slots: depth is the only heading cue
+        with torch.no_grad():
+            latent = enc(frame.clone(), prop)
+        return latent, frame, hidden_before
+
+    def learn_depth_ppo(self, num_learning_iterations, init_at_random_ep_len=False):
+        """Single-stage camera policy: student observations, teacher rewards.
+
+        The rollout collects with `actor_critic`, whose actor is driven by the depth
+        latent through `scandots_latent` (the 32-D latent REPLACES the 32-D height-scan
+        latent) and whose critic keeps the unchanged privileged observation. Rewards
+        come from the teacher's reward function untouched — nothing is distilled. PPO
+        then updates actor + critic + depth encoder together; the encoder also gets the
+        auxiliary scan-latent term (see PPO._depth_latent_batch).
+        """
+        mean_value_loss = 0.
+        mean_surrogate_loss = 0.
+        mean_estimator_loss = 0.
+        mean_disc_loss = 0
+        mean_disc_acc = 0
+        mean_hist_latent_loss = 0.
+        mean_priv_reg_loss = 0.
+        priv_reg_coef = 0.
+        entropy_coef = 0.
+        if init_at_random_ep_len:
+            self.env.episode_length_buf = torch.randint_like(
+                self.env.episode_length_buf, high=int(self.env.max_episode_length))
+        obs = self.env.get_observations()
+        privileged_obs = self.env.get_privileged_observations()
+        critic_obs = privileged_obs if privileged_obs is not None else obs
+        obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
+        infos = {}
+        # Seed step 0 with the freshest frame; afterwards only the env's 10 Hz tick sets
+        # it (None in between => the cached tick pair is reused, 10 Hz encoder cadence).
+        infos["depth"] = (self.env.get_depth_obs().to(self.device)
+                          if self.if_depth else None)
+        depth_latent, depth_frame, depth_hidden = None, None, None
+        self.alg.actor_critic.train()
+        self.alg.depth_encoder.train()
+
+        ep_infos = []
+        rewbuffer = deque(maxlen=100)
+        rew_explr_buffer = deque(maxlen=100)
+        rew_entropy_buffer = deque(maxlen=100)
+        lenbuffer = deque(maxlen=100)
+        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+        tot_iter = self.current_learning_iteration + num_learning_iterations
+        self.start_learning_iteration = copy(self.current_learning_iteration)
+
+        for it in range(self.current_learning_iteration, tot_iter):
+            start = time.time()
+
+            # On-GPU episode bookkeeping, one host transfer after the rollout (no
+            # per-step nonzero / .cpu() sync — same scheme as learn_RL).
+            rew_snapshots, len_snapshots, done_masks = [], [], []
+
+            with torch.inference_mode():
+                for i in range(self.num_steps_per_env):
+                    if infos["depth"] is not None:
+                        depth_latent, depth_frame, depth_hidden = self._depth_tick(
+                            obs, infos["depth"])
+                    if depth_latent is None:
+                        raise RuntimeError(
+                            "[depth PPO] no depth frame was ever produced: check "
+                            "cfg.depth.use_camera and cfg.depth.update_interval.")
+                    actions = self.alg.act(obs, critic_obs, infos, hist_encoding=True,
+                                           depth_latent=depth_latent,
+                                           depth_img=depth_frame,
+                                           depth_hidden=depth_hidden)
+                    obs, privileged_obs, rewards, dones, infos = self.env.step(actions)  # obs has changed to next_obs !! if done obs has been reset
+                    critic_obs = privileged_obs if privileged_obs is not None else obs
+                    obs, critic_obs, rewards, dones = obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
+                    total_rew = self.alg.process_env_step(rewards, dones, infos)
+
+                    if self.log_dir is not None:
+                        if 'episode' in infos:
+                            ep_infos.append(infos['episode'])
+                        cur_reward_sum += total_rew
+                        cur_episode_length += 1
+                        # Snapshot BEFORE the reset so finished episodes keep their
+                        # terminal-step reward; clone() because dones aliases the env's
+                        # reset buffer and the sums are reset in-place just below.
+                        rew_snapshots.append(cur_reward_sum.clone())
+                        len_snapshots.append(cur_episode_length.clone())
+                        done_masks.append(dones.clone())
+                        not_done = (dones == 0).to(cur_reward_sum.dtype)
+                        cur_reward_sum *= not_done
+                        cur_episode_length *= not_done
+
+                if self.log_dir is not None:
+                    n_done = self._flush_episode_stats(
+                        rew_snapshots, len_snapshots, done_masks, rewbuffer, lenbuffer)
+                    rew_explr_buffer.extend([0.0] * n_done)
+                    rew_entropy_buffer.extend([0.0] * n_done)
+
+                stop = time.time()
+                collection_time = stop - start
+
+                # Learning step
+                start = stop
+                self.alg.compute_returns(critic_obs)
+
+            mean_value_loss, mean_surrogate_loss, mean_estimator_loss, mean_disc_loss, mean_disc_acc, mean_priv_reg_loss, priv_reg_coef = self.alg.update()
+            # The encoder is trained inside update(); there is no DAgger pass to run.
+            stop = time.time()
+            learn_time = stop - start
+            if self.log_dir is not None:
+                self.log(locals())
+                print(f"{'Depth aux scan loss:':>35} {self.alg.last_depth_aux_loss:.4f}"
+                      f"   (encoder lr {self.alg.optimizer.param_groups[-1]['lr']:.1e})")
+            if it < 2500:
+                if it % self.save_interval == 0:
+                    self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+            elif it < 5000:
+                if it % (2*self.save_interval) == 0:
+                    self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+            else:
+                if it % (5*self.save_interval) == 0:
+                    self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+            ep_infos.clear()
+
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
 
     def learn_vision(self, num_learning_iterations, init_at_random_ep_len=False):
@@ -591,7 +740,9 @@ class OnPolicyRunner:
             }
         if self.if_depth:
             state_dict['depth_encoder_state_dict'] = self.alg.depth_encoder.state_dict()
-            state_dict['depth_actor_state_dict'] = self.alg.depth_actor.state_dict()
+            # Depth PPO has no separate depth actor (the trained actor IS the depth actor).
+            if getattr(self.alg, 'depth_actor', None) is not None:
+                state_dict['depth_actor_state_dict'] = self.alg.depth_actor.state_dict()
         torch.save(state_dict, path)
 
     def load(self, path, load_optimizer=True):
@@ -606,14 +757,23 @@ class OnPolicyRunner:
             else:
                 print("Saved depth encoder detected, loading...")
                 self.alg.depth_encoder.load_state_dict(loaded_dict['depth_encoder_state_dict'])
-            if 'depth_actor_state_dict' in loaded_dict:
-                print("Saved depth actor detected, loading...")
-                self.alg.depth_actor.load_state_dict(loaded_dict['depth_actor_state_dict'])
-            else:
-                print("No saved depth actor, Copying actor critic actor to depth actor...")
-                self.alg.depth_actor.load_state_dict(self.alg.actor_critic.actor.state_dict())
+            if getattr(self.alg, 'depth_actor', None) is not None:
+                if 'depth_actor_state_dict' in loaded_dict:
+                    print("Saved depth actor detected, loading...")
+                    self.alg.depth_actor.load_state_dict(loaded_dict['depth_actor_state_dict'])
+                else:
+                    print("No saved depth actor, Copying actor critic actor to depth actor...")
+                    self.alg.depth_actor.load_state_dict(self.alg.actor_critic.actor.state_dict())
         if load_optimizer:
-            self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
+            # A warm start from a privileged (teacher) checkpoint carries a single
+            # parameter group, while depth PPO's optimizer has two (policy + encoder):
+            # warn and keep the fresh optimizer instead of aborting the resume.
+            try:
+                self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
+            except (ValueError, KeyError) as e:
+                warnings.warn(
+                    f"optimizer state not loaded ({type(e).__name__}: {e}); "
+                    f"continuing with a freshly initialised optimizer.")
         # self.current_learning_iteration = loaded_dict['iter']
         print("*" * 80)
         return loaded_dict['infos']
