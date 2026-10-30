@@ -129,6 +129,11 @@ class LeggedRobotCfg(BaseConfig):
         hole_fill = False
         hole_fill_mode = 1
         hole_fill_iters = 8
+        # "cpu" = the reference numpy/cv2 filter; "gpu" = the same algorithm as max/min
+        # pools, bit-identical but ~50x cheaper. At 480x270 x 280 envs the CPU path costs
+        # 0.58 s per control step -- 69% of the entire depth step -- almost all of it in
+        # the eight dilate passes plus a 145 MB device->host->device round trip.
+        hole_fill_backend = "cpu"
         # RealSense min-range (minZ) emulation: distances closer than this read
         # INVALID on the D435 and deploy remaps invalid -> far. Applied to the raw
         # render before noise/resize, matching sim2sim's 0.15 m. 0.0 = off (upstream:

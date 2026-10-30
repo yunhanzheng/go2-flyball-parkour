@@ -141,6 +141,8 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             env_cfg.depth.use_camera = args.use_camera
         if getattr(args, "depth_hole_fill", False):
             env_cfg.depth.hole_fill = True
+        if getattr(args, "hole_fill_backend", None):
+            env_cfg.depth.hole_fill_backend = args.hole_fill_backend
         if getattr(args, "raw_depth", False):
             # Raw policy input: keep only crop/resize/normalization.
             env_cfg.depth.dis_noise = 0.0
@@ -318,6 +320,9 @@ def get_args():
          "help": "apply deployment-compatible RealSense hole fill as the final depth preprocessing step"},
         {"name": "--no_depth_hole_fill", "action": "store_true", "default": False,
          "help": "disable only deployment-compatible depth hole filling; keep other camera/PW effects"},
+        {"name": "--hole_fill_backend", "type": str, "default": None, "choices": ["cpu", "gpu"],
+         "help": "which hole-fill implementation to run; the two are bit-identical, gpu only avoids the "
+                 "device->host->device round trip and the 8 numpy dilate passes"},
         {"name": "--save_depth_stages", "action": "store_true", "default": False,
          "help": "save raw/noisy/filled/final depth stages once per second during play"},
         {"name": "--depth_stage_fps", "type": float, "default": 1.0,
