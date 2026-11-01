@@ -57,6 +57,18 @@ class RMS(object):
 
         return self.M, self.S
 
+def _grad_norm(params):
+    """L2 norm of the gradients of `params`, for pre-clip monitoring.
+
+    Params without a gradient (a frozen branch, or the encoder on the DAgger path)
+    contribute nothing, so the result is 0 rather than an error.
+    """
+    grads = [p.grad.detach() for p in params if p.grad is not None]
+    if not grads:
+        return torch.zeros(())
+    return torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(g) for g in grads]))
+
+
 class PPO:
     actor_critic: ActorCriticRMA
     def __init__(self,
@@ -152,6 +164,27 @@ class PPO:
         # KL-adaptive schedule moves the policy lr.
         self.depth_encoder_lr_ratio = 1.0
         self.last_depth_aux_loss = float('nan')
+
+        # Per-iteration diagnostics surfaced by the runner's logger. All of them are
+        # measured on the FIRST minibatch of an update, before that minibatch's
+        # optimizer step, so they reuse a forward pass that already happens.
+        #
+        # last_replay_kl: KL between the action distribution STORED during the rollout
+        # and the one REBUILT from the cached (frame, hidden) pair with the parameters
+        # still untouched. It has to sit at float noise (~1e-4). Anything larger means
+        # the replay does not reproduce the latent the action was taken with, and every
+        # PPO ratio is then measured against a policy that never existed -- which the
+        # KL-adaptive schedule reads as "the step was too big" and walks the lr into
+        # its floor. This is the single cheapest way to catch that class of bug.
+        self.last_replay_kl = float('nan')
+        # 1 = the critic explains the returns perfectly, 0 = no better than predicting
+        # the batch mean, < 0 = worse than that. Value loss alone cannot tell a small
+        # loss apart from a flat one.
+        self.last_explained_var = float('nan')
+        # Pre-clip gradient norms, policy vs depth encoder. Both groups share ONE
+        # clip_grad_norm_, so a dominant encoder starves the actor's update.
+        self.last_grad_norm_policy = float('nan')
+        self.last_grad_norm_depth = float('nan')
         if self.if_depth:
             self.depth_encoder = depth_encoder
             self.depth_encoder_optimizer = optim.Adam(self.depth_encoder.parameters(), lr=depth_encoder_paras["learning_rate"])
@@ -212,23 +245,23 @@ class PPO:
             out[:, 6:8] = 0.0
         return out
 
-    def _depth_latent_batch(self, depth_batch, depth_hidden_batch, obs_batch):
+    def _depth_latent_batch(self, depth_batch, depth_hidden_batch, depth_prop_batch,
+                            obs_batch):
         """Replay the depth encoder for a minibatch at its ROLLOUT-time GRU state.
 
-        The rollout caches (frame, hidden-before) at every 10 Hz encoder tick and
-        reuses that pair on the intermediate 50 Hz steps, so replaying the pair
+        The rollout caches (frame, hidden-before, proprio) at every 10 Hz encoder tick
+        and reuses that triple on the intermediate 50 Hz steps, so replaying the triple
         reproduces the depth latent the action was taken with (up to the weights that
         have moved since) while keeping the encoder cadence identical to deployment.
+        The proprio must be the CACHED one, not each sample's own: on the 4 of 5 steps
+        between ticks the encoder never saw the current proprio.
         Gradients flow through the CNN / combination MLP / output head; the recurrent
         path is truncated at the stored state (BPTT length 1, as at rollout).
 
         Returns (latent, aux_loss_or_None).
         """
         enc = self.depth_encoder
-        prop = obs_batch[:, :self.num_prop]
-        if self.zero_heading_obs:
-            prop = prop.clone()
-            prop[:, 6:8] = 0.0
+        prop = depth_prop_batch
         prev_hidden = enc.hidden_states
         enc.hidden_states = depth_hidden_batch.unsqueeze(0)
         latent = enc(depth_batch, prop)
@@ -246,7 +279,7 @@ class PPO:
         return latent, aux_loss
 
     def act(self, obs, critic_obs, info, hist_encoding=False, depth_latent=None,
-            depth_img=None, depth_hidden=None):
+            depth_img=None, depth_hidden=None, depth_prop=None):
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
         # Compute the actions and values, use proprio to compute estimated priv_states then actions, but store true priv_states
@@ -268,6 +301,7 @@ class PPO:
         # storage carries one replayable encoder input per stored step.
         self.transition.depth = depth_img
         self.transition.depth_hidden = depth_hidden
+        self.transition.depth_prop = depth_prop
 
         self.transition.values = self.actor_critic.evaluate(critic_obs).detach()
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
@@ -315,21 +349,27 @@ class PPO:
         # minibatches whose adapted lr ended up pinned at the floor. kl_mean is
         # already a host float below, so this costs no extra CUDA sync.
         kl_sum, kl_n, lr_floor_hits = 0.0, 0, 0
+        # Explained variance over the whole iteration, accumulated as GPU scalars so
+        # this costs one host sync at the end, not one per minibatch.
+        ev_num = torch.zeros((), device=self.device)
+        ev_den = torch.zeros((), device=self.device)
+        diag_done = False
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
-            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, depth_batch, depth_hidden_batch in generator:
+            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, depth_batch, depth_hidden_batch, depth_prop_batch in generator:
 
                 depth_aux_loss = None
                 if depth_batch is not None:
                     # Depth PPO: rebuild the camera latent from the cached
-                    # (frame, hidden-before) pair and feed it as the scan slot, so the
-                    # distribution being clipped is the deployed one. hist_encoding is
-                    # always on here — the deploy path has no privileged latent.
+                    # (frame, hidden-before, proprio) triple and feed it as the scan
+                    # slot, so the distribution being clipped is the deployed one.
+                    # hist_encoding is always on here — the deploy path has no
+                    # privileged latent.
                     depth_latent, depth_aux_loss = self._depth_latent_batch(
-                        depth_batch, depth_hidden_batch, obs_batch)
+                        depth_batch, depth_hidden_batch, depth_prop_batch, obs_batch)
                     self.actor_critic.act(self.depth_actor_obs(obs_batch), hist_encoding=True,
                                           scandots_latent=depth_latent)
                 else:
@@ -340,6 +380,18 @@ class PPO:
                 mu_batch = self.actor_critic.action_mean
                 sigma_batch = self.actor_critic.action_std
                 entropy_batch = self.actor_critic.entropy
+
+                if not diag_done:
+                    # No optimizer step has run yet in this update, so the parameters
+                    # are exactly the ones that collected the data and this KL is pure
+                    # replay error. Same expression as the lr schedule's KL below.
+                    with torch.inference_mode():
+                        replay_kl = torch.sum(
+                            torch.log(sigma_batch / old_sigma_batch + 1.e-5)
+                            + (torch.square(old_sigma_batch)
+                               + torch.square(old_mu_batch - mu_batch))
+                            / (2.0 * torch.square(sigma_batch)) - 0.5, axis=-1)
+                        self.last_replay_kl = torch.mean(replay_kl).item()
                 
                 # Adaptation module update
                 priv_latent_batch = self.actor_critic.actor.infer_priv_latent(obs_batch)
@@ -415,6 +467,16 @@ class PPO:
                 # Gradient step
                 self.optimizer.zero_grad()
                 loss.backward()
+                if not diag_done:
+                    # Pre-clip, so the numbers show how the two groups actually
+                    # compare before the shared norm budget is applied.
+                    with torch.no_grad():
+                        self.last_grad_norm_policy = _grad_norm(
+                            self.optimizer.param_groups[0]['params']).item()
+                        if len(self.optimizer.param_groups) > 1:
+                            self.last_grad_norm_depth = _grad_norm(
+                                self.optimizer.param_groups[1]['params']).item()
+                    diag_done = True
                 # Both parameter groups (policy, and the encoder under depth PPO).
                 nn.utils.clip_grad_norm_(
                     [p for group in self.optimizer.param_groups for p in group['params']],
@@ -422,6 +484,9 @@ class PPO:
                 self.optimizer.step()
 
                 # Detached GPU accumulation — no host sync inside the loop.
+                with torch.no_grad():
+                    ev_den += returns_batch.var(unbiased=False)
+                    ev_num += (returns_batch - value_batch).var(unbiased=False)
                 mean_value_loss += value_loss.detach()
                 mean_surrogate_loss += surrogate_loss.detach()
                 mean_estimator_loss += estimator_loss.detach()
@@ -439,6 +504,7 @@ class PPO:
         # Surfaced for the runner's log line (kept off the return tuple so the
         # signature and every call site stay untouched).
         self.last_depth_aux_loss = mean_depth_aux_loss
+        self.last_explained_var = float(1.0 - (ev_num / ev_den.clamp_min(1.e-8)).item())
         mean_discriminator_loss /= num_updates
         mean_discriminator_acc /= num_updates
         # Read by the runner for logging (kept off the return tuple so the
@@ -456,7 +522,7 @@ class PPO:
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
-            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, _depth_batch, _depth_hidden_batch in generator:
+            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, _depth_batch, _depth_hidden_batch, _depth_prop_batch in generator:
                 with torch.inference_mode():
                     self.actor_critic.act(obs_batch, hist_encoding=True, masks=masks_batch, hidden_states=hid_states_batch[0])
 

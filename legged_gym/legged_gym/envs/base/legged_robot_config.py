@@ -65,6 +65,14 @@ class LeggedRobotCfg(BaseConfig):
         terminate_on_lateral_deviation = False
         lateral_deviation_term_m = 1.5   # m
 
+        # Terminate once the TRUNK's world x is past the flyball backing wall's back
+        # face. That can only happen by walking AROUND the plate (the wall is 2 m
+        # tall and shares the plate's width), which no goal circuit can recover from.
+        # Trunk-based on purpose: a planted foot reaches the plate's top edge, one
+        # wall-thickness in front of that face, so a foot test would kill good plants.
+        # Only bites on flyball envs (class 19/15); other tiles export a 0.0 sentinel.
+        terminate_behind_wall = True
+
 
         
         
@@ -239,7 +247,7 @@ class LeggedRobotCfg(BaseConfig):
         flyball_pit_depth = 2.0                         # [m] fixed pit depth (deep enough to be terminal)
         flyball_wall_angle_deg_range = (20.0, 50.0)    # [deg] Alpha: wall incline (50=easy, 90=hard)
         flyball_plate_width = 1.5                       # [m] inclined contact plate lateral width
-        flyball_backing_wall_height = 2.0               # [m] full-column wall height above approach floor
+        flyball_backing_wall_height = 2.0               # [m] wall height above approach floor (width follows flyball_plate_width)
         flyball_backing_wall_thickness = 0.35           # [m] wall depth behind the plate's upper edge
         flyball_wall_contact_fxfz_threshold = -0.5     # fx/fz ratio threshold: foot on wall when ratio < this
         # WoCoCo contact region parameters (offsets relative to wall_front_x or corridor centre)

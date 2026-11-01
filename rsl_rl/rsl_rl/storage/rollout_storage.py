@@ -52,6 +52,7 @@ class RolloutStorage:
             # update() can replay the exact same encoder call per sample.
             self.depth = None
             self.depth_hidden = None
+            self.depth_prop = None
         def clear(self):
             self.__init__()
 
@@ -92,6 +93,7 @@ class RolloutStorage:
         # depth PPO (allocated lazily on the first add_transitions that carries a frame)
         self.depth = None
         self.depth_hidden = None
+        self.depth_prop = None
 
         self.step = 0
 
@@ -109,17 +111,23 @@ class RolloutStorage:
         self.sigma[self.step].copy_(transition.action_sigma)
 
         self._save_hidden_states(transition.hidden_states)
-        self._save_depth(transition.depth, transition.depth_hidden)
+        self._save_depth(transition.depth, transition.depth_hidden, transition.depth_prop)
         self.step += 1
 
-    def _save_depth(self, depth, depth_hidden):
-        """Store one (frame, GRU-hidden-before) pair per transition.
+    def _save_depth(self, depth, depth_hidden, depth_prop):
+        """Store one (frame, GRU-hidden-before, proprio) triple per transition.
 
         Frames go in as fp16 (halves the buffer; the encoder runs in fp32 and the
         generator casts back) and hidden states stay fp32 because they feed the GRU
         directly. Allocation is forced OUT of inference mode: the rollout runs inside
         torch.inference_mode(), and a tensor born there cannot later receive a
         grad-requiring copy_ from update().
+
+        depth_prop is the proprio the encoder ACTUALLY consumed at the tick, which on
+        the 4 of 5 steps between ticks is NOT this step's own proprio. Storing it is
+        what lets update() reproduce the rollout latent bit-for-bit; replaying the
+        step's own proprio instead silently feeds the encoder a different second
+        input and offsets the action distribution by ~10 degrees.
         """
         if depth is None:
             return
@@ -131,8 +139,13 @@ class RolloutStorage:
                                                depth_hidden.shape[0],
                                                depth_hidden.shape[-1],
                                                device=self.device)
+                self.depth_prop = torch.zeros(self.observations.shape[0],
+                                              depth_prop.shape[0],
+                                              depth_prop.shape[-1],
+                                              device=self.device)
         self.depth[self.step].copy_(depth.to(torch.float16))
         self.depth_hidden[self.step].copy_(depth_hidden)
+        self.depth_prop[self.step].copy_(depth_prop)
 
     def _save_hidden_states(self, hidden_states):
         if hidden_states is None or hidden_states==(None, None):
@@ -208,6 +221,8 @@ class RolloutStorage:
         depth = self.depth.flatten(0, 1) if self.depth is not None else None
         depth_hidden = (self.depth_hidden.flatten(0, 1)
                         if self.depth_hidden is not None else None)
+        depth_prop = (self.depth_prop.flatten(0, 1)
+                      if self.depth_prop is not None else None)
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -229,14 +244,16 @@ class RolloutStorage:
                 if depth is not None:
                     depth_batch = depth[batch_idx].to(torch.float32)
                     depth_hidden_batch = depth_hidden[batch_idx]
+                    depth_prop_batch = depth_prop[batch_idx]
                 else:
                     depth_batch = None
                     depth_hidden_batch = None
+                    depth_prop_batch = None
 
                 
                 yield obs_batch, critic_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, \
                        old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None, \
-                       depth_batch, depth_hidden_batch
+                       depth_batch, depth_hidden_batch, depth_prop_batch
 
     # for RNNs only
     def reccurent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
@@ -290,6 +307,6 @@ class RolloutStorage:
                 # replayed per flattened sample time. Keep the tuple arity in sync.
                 yield obs_batch, critic_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, \
                        old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (hid_a_batch, hid_c_batch), masks_batch, \
-                       None, None
+                       None, None, None
                 
                 first_traj = last_traj

@@ -261,7 +261,7 @@ def flyball_wall_terrain(
     """
     Wall-turn terrain (no pit): robot sprints to an inclined plate, plants feet,
     pushes off, and returns. The plate leans against a taller backing wall that
-    spans the full terrain-column width.
+    shares the plate's lateral footprint, so the corridor either side stays open.
 
     Curriculum variables (all scale 0→1 with difficulty):
       - Alpha  (wall_angle_deg_range): wall incline angle, easy=50° → hard=90°
@@ -454,8 +454,17 @@ def flyball_wall_terrain(
     backing_height_m = max(float(backing_wall_height), delta_z + wall_height)
     backing_top_h = base_h + int(round(backing_height_m / vs))
     if build_wall:
-        backing = terrain.height_field_raw[backing_front_px:backing_back_px, :]
+        # Same lateral footprint as the plate: the block must not fill the whole
+        # column, or the corridor either side of the plate is walled off too.
+        backing = terrain.height_field_raw[
+            backing_front_px:backing_back_px, _plate_y_lo:_plate_y_hi]
         np.maximum(backing, backing_top_h, out=backing)
+    # Back face of the backing wall, exported for the env's "went around the
+    # plate" termination. Only the TRUNK can ever be past it during a legal
+    # plant (the feet top out on the plate, ~0.35 m in front). 0.0 = no wall on
+    # this tile, which disables the check.
+    terrain.flyball_wall_back_x_world = (
+        float(backing_back_px * hs) if build_wall else 0.0)
 
     # Hurdles are raised after the wall so they don't interact with the wall area.
     hurdle_x_lo = -1.0

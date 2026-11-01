@@ -1049,6 +1049,18 @@ class LeggedRobot(BaseTask):
         else:
             premature_wall = torch.zeros_like(wococo_env)
 
+        # Went around the plate instead of over it: term when the TRUNK's world x
+        # passes the backing wall's back face. Trunk, not feet, is what makes this
+        # safe -- a planted foot legitimately reaches the plate's top edge, which
+        # is one wall-thickness (0.35 m) in FRONT of that face, while the trunk
+        # stays ~0.3 m further back again. Tiles without a wall export 0.0.
+        behind_wall = torch.zeros_like(wococo_env)
+        if bool(getattr(self.cfg.env, 'terminate_behind_wall', True)):
+            _back_x = getattr(self, 'env_flyball_wall_back_x', None)
+            if _back_x is not None:
+                behind_wall = (wococo_env & (_back_x > 0.0)
+                               & (self.root_states[:, 0] > _back_x))
+
         # Latch first sentinel entry for post-plant roll and yaw grace periods.
         at_sentinel = self.wococo_contact_stage >= self._wococo_sentinel_stage
         newly_sentinel = at_sentinel & (self.wococo_sentinel_reached_step < 0)
@@ -1195,6 +1207,7 @@ class LeggedRobot(BaseTask):
         self.reset_buf |= lateral_cutoff
         self.reset_buf |= stage1_ground
         self.reset_buf |= stage2_overshoot
+        self.reset_buf |= behind_wall
 
         # Expose per-cause flags so reset_idx can log which termination actually fired.
         self.term_roll            = roll_cutoff
@@ -1209,6 +1222,7 @@ class LeggedRobot(BaseTask):
         self.term_yaw_tracking    = yaw_track_cutoff
         self.term_plant_dwell     = plant_dwell
         self.term_lateral         = lateral_cutoff
+        self.term_behind_wall     = behind_wall
         # Not a termination: the per-env mask of envs whose roll / pitch / base-contact kills were suppressed this step (logged as wococo/armed_term_exempt).
         self.wococo_armed_term_exempt = armed_term_exempt
 
@@ -1350,6 +1364,7 @@ class LeggedRobot(BaseTask):
             _c[self.term_lateral[env_ids]]        = 9
             _c[self.term_wococo_stage1_ground[env_ids]]    = 10
             _c[self.term_wococo_stage2_overshoot[env_ids]] = 11
+            _c[self.term_behind_wall[env_ids]]             = 12
             _c[self.term_roll[env_ids]]           = 1   # roll assigned last → wins ties (wall-plant cause)
             self.last_term_code[env_ids] = _c
         self.obs_history_buf[env_ids, :, :] = 0.  # reset obs history buffer TODO no 0s
@@ -1640,7 +1655,7 @@ class LeggedRobot(BaseTask):
         for key in ("term_roll", "term_pitch", "term_height",
                     "term_base_contact", "term_reach_goal", "term_timeout",
                     "term_yaw_tracking", "term_plant_dwell",
-                    "term_lateral"):
+                    "term_lateral", "term_behind_wall"):
             if hasattr(self, key):
                 self.extras["episode"][key] = getattr(self, key)[env_ids].float().mean()
         # Plant-failure early terminations, with the curriculum arm-latch state (0 until the fleet reaches the arm level).
@@ -2417,6 +2432,7 @@ class LeggedRobot(BaseTask):
         self.env_flyball_pit_mid = (self.env_flyball_pit_x0 + self.env_flyball_pit_x1) * 0.5
         self.env_flyball_forbidden_x0 = self.terrain_flyball_forbidden_x0[self.terrain_levels, self.terrain_types]
         self.env_flyball_forbidden_x1 = self.terrain_flyball_forbidden_x1[self.terrain_levels, self.terrain_types]
+        self.env_flyball_wall_back_x = self.terrain_flyball_wall_back_x[self.terrain_levels, self.terrain_types]
         self.env_flyball_wall_angle_deg  = self.terrain_flyball_wall_angle_deg[self.terrain_levels, self.terrain_types]
         self.env_flyball_wall_delta_z    = self.terrain_flyball_wall_delta_z[self.terrain_levels, self.terrain_types]
         self.env_flyball_liftoff_region  = self.terrain_flyball_liftoff_region[self.terrain_levels, self.terrain_types]
@@ -2472,6 +2488,9 @@ class LeggedRobot(BaseTask):
             self.terrain_levels, self.terrain_types
         ]
         self.env_flyball_forbidden_x1 = self.terrain_flyball_forbidden_x1[
+            self.terrain_levels, self.terrain_types
+        ]
+        self.env_flyball_wall_back_x = self.terrain_flyball_wall_back_x[
             self.terrain_levels, self.terrain_types
         ]
         self.env_flyball_wall_angle_deg = self.terrain_flyball_wall_angle_deg[
@@ -3239,6 +3258,7 @@ class LeggedRobot(BaseTask):
             self.terrain_flyball_pit_x1 = torch.from_numpy(self.terrain.flyball_pit_x1).to(self.device).to(torch.float)
             self.terrain_flyball_forbidden_x0 = torch.from_numpy(self.terrain.flyball_forbidden_x0).to(self.device).to(torch.float)
             self.terrain_flyball_forbidden_x1 = torch.from_numpy(self.terrain.flyball_forbidden_x1).to(self.device).to(torch.float)
+            self.terrain_flyball_wall_back_x = torch.from_numpy(self.terrain.flyball_wall_back_x).to(self.device).to(torch.float)
             self.terrain_flyball_wall_angle_deg = torch.from_numpy(self.terrain.flyball_wall_angle_deg).to(self.device).float()
             self.terrain_flyball_wall_delta_z   = torch.from_numpy(self.terrain.flyball_wall_delta_z).to(self.device).float()
             self.terrain_flyball_liftoff_region = torch.from_numpy(self.terrain.flyball_liftoff_region).to(self.device).float()
@@ -3268,6 +3288,7 @@ class LeggedRobot(BaseTask):
             self.env_flyball_pit_mid = (self.env_flyball_pit_x0 + self.env_flyball_pit_x1) * 0.5
             self.env_flyball_forbidden_x0 = self.terrain_flyball_forbidden_x0[self.terrain_levels, self.terrain_types]
             self.env_flyball_forbidden_x1 = self.terrain_flyball_forbidden_x1[self.terrain_levels, self.terrain_types]
+            self.env_flyball_wall_back_x = self.terrain_flyball_wall_back_x[self.terrain_levels, self.terrain_types]
             self.env_flyball_wall_angle_deg  = self.terrain_flyball_wall_angle_deg[self.terrain_levels, self.terrain_types]
             self.env_flyball_wall_delta_z    = self.terrain_flyball_wall_delta_z[self.terrain_levels, self.terrain_types]
             self.env_flyball_liftoff_region  = self.terrain_flyball_liftoff_region[self.terrain_levels, self.terrain_types]
