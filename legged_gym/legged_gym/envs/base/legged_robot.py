@@ -717,6 +717,16 @@ class LeggedRobot(BaseTask):
         # First two steps of an episode: prefill every ring slot as the legacy path does (lag suppressed until the buffer refills).
         fresh = self.episode_length_buf <= 1
         active = due | fresh
+        # Partial fleet (cfg.depth.num_depth_envs): only the FIRST nd envs are ever
+        # rendered, so a big PPO batch (6144) can coexist with a small depth-BC
+        # subset (480) instead of paying N ray-casts for frames nobody consumes.
+        # Rows >= nd keep whatever their buffer held; every consumer must index
+        # the same prefix (t18 snapshots obs[:nd] / get_depth_obs()[:nd]).
+        nd = int(getattr(self.cfg.depth, "num_depth_envs", 0) or 0)
+        partial = 0 < nd < self.num_envs
+        if partial:
+            active = active.clone()
+            active[nd:] = False
         depth = self.warp_cam.render(
             self.root_states[:, :3], self.base_quat,
             body_pos=self.rigid_body_states[..., 0:3],
@@ -726,20 +736,24 @@ class LeggedRobot(BaseTask):
             active=active)                      # only these rows are valid
         # The post-process runs on the FULL batch on purpose: the degradation carries per-env temporal state (blind-spot random walk, drifting hole field) that must advance once per call.
         # Rows of envs that were not cast are computed and dropped; the rays are the cost.
-        new_frame = self.process_depth_batch(depth)
+        # With a partial fleet the batch IS the prefix, so the per-env state slices
+        # inside process_depth_batch (pw_bs_k[:N], _pw_low, depth_noise_scale[:N])
+        # still line up with rows 0..nd-1: those frames stay correct, the unused
+        # rows simply stop advancing.
+        m = nd if partial else depth.shape[0]
+        new_frame = self.process_depth_batch(depth[:m])
+        buf = self.depth_buffer[:m]
         # Masked writes, not index lists: avoids a per-step nonzero()/host sync in the rollout hot loop.
-        n_slots = self.depth_buffer.shape[1]
-        roll = active.view(-1, 1, 1)
+        n_slots = buf.shape[1]
+        roll = active[:m].view(-1, 1, 1)
         for s in range(n_slots - 1):            # shift older slots down one
-            self.depth_buffer[:, s] = torch.where(roll, self.depth_buffer[:, s + 1],
-                                                  self.depth_buffer[:, s])
-        self.depth_buffer[:, -1] = torch.where(roll, new_frame, self.depth_buffer[:, -1])
+            buf[:, s] = torch.where(roll, buf[:, s + 1], buf[:, s])
+        buf[:, -1] = torch.where(roll, new_frame, buf[:, -1])
         if n_slots > 1:
             # Fresh episodes: every slot holds the new frame, so no pre-reset frame can be served.
-            init = fresh.view(-1, 1, 1)
+            init = fresh[:m].view(-1, 1, 1)
             for s in range(n_slots - 1):
-                self.depth_buffer[:, s] = torch.where(init, new_frame,
-                                                      self.depth_buffer[:, s])
+                buf[:, s] = torch.where(init, new_frame, buf[:, s])
 
     def get_depth_obs(self):
         """The depth frame the policy/encoder consumes, with per-env camera
@@ -2920,6 +2934,18 @@ class LeggedRobot(BaseTask):
                                             self.cfg.depth.buffer_len,
                                             self.cfg.depth.resized[1],
                                             self.cfg.depth.resized[0]).to(self.device)
+            # Partial-fleet capture (t18 path B): only rows < nd render, which is
+            # only possible when each env is cast on its own due step.
+            _nd = int(getattr(self.cfg.depth, "num_depth_envs", 0) or 0)
+            if 0 < _nd < self.num_envs:
+                if not self._depth_on_demand():
+                    raise ValueError("cfg.depth.num_depth_envs < num_envs requires "
+                                     "cfg.depth.render_on_demand = True (use_warp, "
+                                     "capture_interval == 1): the eager path casts "
+                                     "the whole fleet every capture step, so a "
+                                     "subset would not save any ray")
+                print(f"[depth] partial-fleet capture: envs 0..{_nd - 1} of "
+                      f"{self.num_envs} render; rows >= {_nd} hold unused frames")
             if self._warp_enabled():
                 from legged_gym.utils.warp_cam import WarpDepthCamera
                 if not hasattr(self.terrain, "vertices"):
