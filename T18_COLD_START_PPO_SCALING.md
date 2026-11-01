@@ -147,3 +147,10 @@ torch.load(ckpt, map_location='cpu')['model_state_dict']['std'].mean()
 4. **LVL mean 离开 0**：样本量等效 new-run-v2 的 iter~150 时（≈35M 步，
    即 run4 的 iter ~760）应看到第一批晋升；iter 2000（≈92M 步）仍全员 row 0
    则冷启动可行性存疑，回头重议热启动或 flat_baseline 血脉的价值。
+
+## 10. 后续（2026-11-01 晚）：run5/run6 全部回退，改走路 B
+
+run4 触顶后先试 A（`EP_T18_MAXLR=1e-3`，run5），随后按用户指令**取消全部 PPO 改动**
+（ppo.py 的 E 改动逐字还原、覆盖参数一律不设），run6 起即在初始化阶段被叫停。
+结论是病根在规模而非超参：480 env 是"大 PPO + 相机"被绑成一个 run 的妥协产物。
+最终方案与实测见 `T18_PATH_B_PARTIAL_FLEET.md`（部分机队深度采集，6144 env + 480 子集）。
