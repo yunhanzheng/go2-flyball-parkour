@@ -189,6 +189,12 @@ def main():
         m = re.search(r"model_(\d+)\.pt", ex.resume_ckpt)
         start_it = int(m.group(1)) + 1 if m else 0
         print(f"[joint] resumed {ex.resume_ckpt} -> start iter {start_it}", flush=True)
+    if ex.init_std is not None:
+        with torch.no_grad():
+            old = ac.std.mean().item()
+            ac.std.fill_(ex.init_std)
+        print(f"[joint] --init_std: actor action std {old:.3f} -> {ex.init_std:.3f} "
+              f"(KL sensitivity ~1/std^2, so this is what un-pins the adaptive lr)", flush=True)
 
     def new_hidden():
         return torch.zeros(1, NBC, enc.rnn.hidden_size, device=dev)
