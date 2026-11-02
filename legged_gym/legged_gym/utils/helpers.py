@@ -143,6 +143,10 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             env_cfg.depth.hole_fill = True
         if getattr(args, "hole_fill_backend", None):
             env_cfg.depth.hole_fill_backend = args.hole_fill_backend
+        if getattr(args, "num_depth_envs", None) is not None:
+            env_cfg.depth.num_depth_envs = args.num_depth_envs
+        if getattr(args, "render_on_demand", False):
+            env_cfg.depth.render_on_demand = True
         if getattr(args, "raw_depth", False):
             # Raw policy input: keep only crop/resize/normalization.
             env_cfg.depth.dis_noise = 0.0
@@ -334,6 +338,13 @@ def get_args():
         {"name": "--hole_fill_backend", "type": str, "default": None, "choices": ["cpu", "gpu"],
          "help": "which hole-fill implementation to run; the two are bit-identical, gpu only avoids the "
                  "device->host->device round trip and the 8 numpy dilate passes"},
+        {"name": "--render_on_demand", "action": "store_true", "default": False,
+         "help": "cast each env only on the capture step whose frame it consumes (needs use_warp); "
+                 "required by --num_depth_envs and ~update_interval x cheaper on rays"},
+        {"name": "--num_depth_envs", "type": int, "default": None,
+         "help": "render depth for the FIRST N envs only while the physics fleet stays at --num_envs. "
+                 "This is how a student keeps a 6144-env teacher's fleet size instead of dropping to "
+                 "depth.camera_num_envs; needs --render_on_demand"},
         {"name": "--save_depth_stages", "action": "store_true", "default": False,
          "help": "save raw/noisy/filled/final depth stages once per second during play"},
         {"name": "--depth_stage_fps", "type": float, "default": 1.0,

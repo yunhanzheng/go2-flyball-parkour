@@ -119,6 +119,17 @@ class LeggedRobotCfg(BaseConfig):
         # lag, ~update_interval x fewer rays; needs use_warp, capture_interval 1.
         render_on_demand = False
 
+        # Partial-fleet capture: render depth for the FIRST N envs only, while the
+        # physics fleet stays at env.num_envs. 0 = the whole fleet (original
+        # behaviour). This is what lets a student distil from a 6144-env teacher
+        # instead of dropping the whole run to depth.camera_num_envs (280): rendering
+        # is the cost that scales with num_envs, the BC target does not need every
+        # env to have a frame. Requires render_on_demand, and the env asserts it at
+        # init. Prefix only, never a scattered row subset: process_depth_batch indexes
+        # its per-env degradation state by row (pw_bs_k[:N], _pw_low,
+        # depth_noise_scale[:n]), so scattered rows would write it onto the wrong envs.
+        num_depth_envs = 0
+
         original = (106, 60)
         resized = (87, 58)
         horizontal_fov = 87
