@@ -122,12 +122,18 @@ class Go2TeacherCfg( Go2RoughCfg ):
         action_delay_ramp_steps       = 0
         randomize_contact_threshold = False
 
-        # Fleet-mean DR ramp: the ceiling reaches full DR at mean level 6, and each
-        # reset samples a per-env scale below it. Resumes are pre-armed by helpers.py.
+        # Every reset samples a per-env dr_scale below the ceiling set by
+        # dr_ramp_full_at_mean_level (see the note on that field below).
         dr_scale_range             = [0.0, 1.0]
         dr_lock_to_terrain_level   = True
         dr_ramp_use_mean_level     = True
         dr_scale_sample_per_env    = True
+        # Back to 6.0 after the new-run-v3 trial at 9.0. Deferring DR did help on
+        # its own terms -- 8-row full-DR reach 0.238 -> 0.381, and the climb to row 7
+        # went from 1800 to 300 iters -- but the curriculum still parked at mean level
+        # 7.0, because the real blocker is the promote/demote band (3/8 up, <2/8 down
+        # bounces every env between rows 7 and 8). Reverted so the next run changes
+        # only the curriculum gate; REAL runs a fixed full-range DR with no ramp at all.
         dr_ramp_full_at_mean_level = 6.0
         dr_ramp_arm_below_mean_level = 0.5
         dr_ramp_start_armed        = False
@@ -260,7 +266,18 @@ class Go2TeacherCfg( Go2RoughCfg ):
         exempt_hurdle_contact_from_clip   = True
         exempt_hurdle_clearance_from_clip = False
         exempt_wococo_contact_pts_from_clip = True   # n_wrong must reach negative
-        # Clip only below level 2, so regularization bites once past cold start.
+        # OFF. With the clip on (legged_gym's default), a step whose term sum is
+        # negative is rewritten to 0 before `termination` is added, so the ONLY
+        # thing that reaches the gradient is the -3.0 fall price: measured on
+        # my-teacher ckpt1000, the episode ledger was +0.35 of task reward against
+        # -34.4 of penalties, clipped to 0, leaving Mean reward (total) = -0.03 =
+        # 1% falls * -3.0. That objective pays for standing still and nothing else
+        # (the policy crouched, froze at 98.5% timeout, terrain_level 0 for 1143
+        # iterations), so the shaping terms must keep their sign. IsaacLab's Go2
+        # flat config has no such clip either.
+        # The two lines below are inert while this is False; they only matter if
+        # the clip is ever switched back on.
+        only_positive_rewards = False
         only_positive_rewards_exempt_high_levels = True
         only_positive_rewards_clip_below_level    = 2
 
@@ -391,7 +408,21 @@ class Go2TeacherCfg( Go2RoughCfg ):
         wococo_stage2_overshoot_margin_m     = 0.45
         wococo_stage1_ground_max_z           = 0.05
 
-        enable_wococo_armed_term_exempt      = True
+        # DISABLED: this was the second biggest destabiliser of new-run. It fired on
+        # the SAME iteration as the 20 ms action-delay latch (both keyed to fleet
+        # mean level 6.0) and, with ramp_steps = 0, deleted roll/pitch/base_contact
+        # termination in ONE step. Measured 5120 -> 5150: mean reward +0.03 -> -48.57,
+        # term_timeout 0.12 -> 0.42, ep_length 676 -> 682 and then 944 by iter 5500,
+        # s1_hold_ok 0.303 -> 0.026 -> 0.000. The robot fell and then lay still for the
+        # rest of the 20 s episode: 0 recoveries in the following 4500 iterations.
+        # It cannot buy get-up ability -- no reward term pays for self-righting, and
+        # wococo_armed stays latched after a fall, so re-accelerating for another
+        # plant earns no tracking income. Attitude/contact terminations therefore
+        # stay ACTIVE at every level (0-9). The banked wall plant does not need them:
+        # roll_term_deg = 95 already admits the -wall_angle lean, and the 0-6 levels
+        # were learned with zero slack (term_base_contact 0.13-0.22 throughout).
+        # Parameters below are kept so the mechanism can be re-enabled for an A/B run.
+        enable_wococo_armed_term_exempt      = False
         wococo_armed_term_exempt_min_mean_level = 6.0
         wococo_armed_term_exempt_ramp_steps  = 0
         wococo_armed_roll_term_max_deg       = None
