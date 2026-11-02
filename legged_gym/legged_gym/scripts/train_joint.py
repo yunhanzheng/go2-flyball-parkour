@@ -57,8 +57,15 @@ from legged_gym import LEGGED_GYM_ROOT_DIR
 
 
 def parse_extra_args():
-    """Knobs that belong to this loop only, so get_args() stays task-agnostic."""
-    p = argparse.ArgumentParser(add_help=False)
+    """Knobs that belong to this loop only, so get_args() stays task-agnostic.
+
+    allow_abbrev=False is required: with argparse's default prefix matching, the shared
+    parser's "--resume" is an unambiguous abbreviation of this parser's "--resume_ckpt",
+    so parse_known_args swallows it and then dies with "--resume_ckpt: expected one
+    argument" -- i.e. the upstream resume recipe (--resume --resumeid flat_baseline)
+    could not even start. Turning abbreviations off here leaves --resume in `rest`.
+    """
+    p = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     p.add_argument("--act_w", type=float, default=1.0, help="weight of the action-BC term")
     p.add_argument("--lat_w", type=float, default=1.0,
                    help="weight of the latent-consistency term (depth latent vs the actor's own scan latent)")
