@@ -81,6 +81,11 @@ def parse_extra_args():
     p.add_argument("--steps_per_env", type=int, default=None, help="override runner.num_steps_per_env")
     p.add_argument("--desired_kl", type=float, default=None, help="override algorithm.desired_kl")
     p.add_argument("--max_lr", type=float, default=None, help="override algorithm.max_learning_rate")
+    p.add_argument("--init_std", type=float, default=None,
+                   help="after loading a checkpoint, overwrite the actor's learned action std "
+                        "with this. A privileged teacher ckpt (flat_baseline) carries std~0.11, "
+                        "and because KL scales like delta_mu^2/std^2 that near-deterministic "
+                        "policy pins the adaptive lr at its floor for hundreds of iterations")
     p.add_argument("--no_tf32", action="store_true", default=False,
                    help="disable TF32 matmuls (default on, matching train.py)")
     known, rest = p.parse_known_args()
