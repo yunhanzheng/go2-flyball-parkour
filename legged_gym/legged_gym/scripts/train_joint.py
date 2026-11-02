@@ -121,6 +121,22 @@ def main():
     if ex.steps_per_env is not None:
         train_cfg.runner.num_steps_per_env = ex.steps_per_env
 
+    # --nodelay is applied in train.py, not in helpers.update_cfg_from_args, and this
+    # script bypasses train.py -- so it has to be mirrored here or the flag is parsed
+    # and silently dropped. Without it go2_teacher keeps action_delay=True with
+    # latch_mean_level 6.0: no delay while the curriculum climbs, then a hard 20 ms
+    # step the moment the fleet mean reaches row 6 (ramp_steps = 0), which is exactly
+    # what the new-run-v2 teacher runs turned off.
+    if getattr(args, "nodelay", False):
+        env_cfg.domain_rand.action_delay = False
+        env_cfg.domain_rand.action_delay_start_latched = False
+        print("[joint] --nodelay: action delay OFF (0 ms) - NOT deploy-faithful", flush=True)
+    else:
+        print(f"[joint] action delay: {env_cfg.domain_rand.action_delay} "
+              f"latch_mean_level={getattr(env_cfg.domain_rand, 'action_delay_latch_mean_level', None)} "
+              f"start_latched={getattr(env_cfg.domain_rand, 'action_delay_start_latched', None)} "
+              f"(pass --nodelay for the new-run-v2 lag-free dynamics)", flush=True)
+
     env, env_cfg = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
     runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args,
                                                       train_cfg=train_cfg, init_wandb=False)
