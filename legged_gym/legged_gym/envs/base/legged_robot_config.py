@@ -65,6 +65,19 @@ class LeggedRobotCfg(BaseConfig):
         terminate_on_lateral_deviation = False
         lateral_deviation_term_m = 1.5   # m
 
+        # Terminate once the TRUNK's world x is past the flyball backing wall's back
+        # face. That can only happen by walking AROUND the plate (the wall is 2 m
+        # tall and shares the plate's width), which no goal circuit can recover from.
+        # Trunk-based on purpose: a planted foot reaches the plate's top edge, one
+        # wall-thickness in front of that face, so a foot test would kill good plants.
+        # Only bites on flyball envs (class 19/15); other tiles export a 0.0 sentinel.
+        # OFF in this branch: it belongs to the 1ccc930 terrain, where the backing
+        # wall was narrowed to the plate's footprint and the corridor either side
+        # opened up. Here flyball_wall.py is still at 1602a16, so the wall spans the
+        # full column, there is nothing to walk around, and new-run never had this
+        # termination. The tiles also export 0.0, which the guard below would skip.
+        terminate_behind_wall = False
+
 
         
         
@@ -129,6 +142,11 @@ class LeggedRobotCfg(BaseConfig):
         hole_fill = False
         hole_fill_mode = 1
         hole_fill_iters = 8
+        # "cpu" = the reference numpy/cv2 filter; "gpu" = the same algorithm as max/min
+        # pools, bit-identical but ~50x cheaper. At 480x270 x 280 envs the CPU path costs
+        # 0.58 s per control step -- 69% of the entire depth step -- almost all of it in
+        # the eight dilate passes plus a 145 MB device->host->device round trip.
+        hole_fill_backend = "cpu"
         # RealSense min-range (minZ) emulation: distances closer than this read
         # INVALID on the D435 and deploy remaps invalid -> far. Applied to the raw
         # render before noise/resize, matching sim2sim's 0.15 m. 0.0 = off (upstream:

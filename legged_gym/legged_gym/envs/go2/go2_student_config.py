@@ -104,6 +104,11 @@ class Go2StudentCfg(Go2TeacherCfg):
         # Apply the same deployment-compatible RealSense fill after PW holes.
         hole_fill = True
         hole_fill_iters = 8
+        # The numpy filter costs 0.58 s per control step here (8 dilate passes over
+        # 480x270 x 280 envs + a 145 MB device<->host round trip), i.e. ~69% of the
+        # whole depth step. The GPU backend is the same function expressed as
+        # max/min pools and is bit-identical (tests/test_hole_fill_backend.py).
+        hole_fill_backend = "gpu"
         hole_fill_upscale = False
         hole_fill_width = 480
         hole_fill_height = 270

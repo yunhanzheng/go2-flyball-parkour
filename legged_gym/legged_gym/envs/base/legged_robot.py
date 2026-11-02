@@ -499,6 +499,8 @@ class LeggedRobot(BaseTask):
         """Apply deployment hole fill at the physical camera resolution."""
         if not getattr(self.cfg.depth, "hole_fill", False):
             return depth
+        if str(getattr(self.cfg.depth, "hole_fill_backend", "cpu")).lower() == "gpu":
+            return self._hole_fill_gpu(depth)
         from legged_gym.utils.depth_hole_fill import hole_fill
         positive = (-depth).detach().cpu().numpy()
         invalid = positive >= float(self.cfg.depth.far_clip) - 1e-4
@@ -519,6 +521,60 @@ class LeggedRobot(BaseTask):
         ]
         return -torch.from_numpy(np.stack(filled)).to(
             device=depth.device, dtype=depth.dtype)
+
+    def _hole_fill_gpu(self, depth):
+        """`hole_fill` executed on the device -- same frame, bit for bit.
+
+        dilate/erode become max/min pools: MaxPool2d pads with -inf and MinPool2d
+        (max of the negated tensor) with +inf, i.e. exactly the identity of their op,
+        which is what cv2's default BORDER_CONSTANT (DBL_MAX / -DBL_MAX) gives, so the
+        border is excluded identically. `fill_from_left` is a cummax along the row.
+
+        The CPU version breaks out of the loop when a pass changes nothing; here the
+        fixed trip count is used instead. That is the same result, not an
+        approximation: one pass is a deterministic function of the frame, so a pass
+        that changes nothing cannot make the next one change anything.
+
+        Why it matters: at 480x270 x 280 envs the numpy path costs 0.58 s per call
+        (8 dilate passes over 36.3 M pixels plus a 145 MB device->host->device round
+        trip, both per control step). The pools run the same 8 passes on the GPU in
+        ~10 ms and never leave the device.
+        """
+        far = float(self.cfg.depth.far_clip)
+        mode = int(getattr(self.cfg.depth, "hole_fill_mode", 1))
+        iters = int(getattr(self.cfg.depth, "hole_fill_iters", 8))
+        pos = -depth
+        # This adapter carries "invalid" as far_clip rather than 0 (see the convention
+        # note in depth_hole_fill.py); the filter wants 0.
+        pos = torch.where(pos >= far - 1e-4, torch.zeros_like(pos), pos)
+        if getattr(self.cfg.depth, "hole_fill_upscale", False):
+            fill_h = int(getattr(self.cfg.depth, "hole_fill_height", 270))
+            fill_w = int(getattr(self.cfg.depth, "hole_fill_width", 480))
+            if tuple(pos.shape[-2:]) != (fill_h, fill_w):
+                pos = F.interpolate(pos.unsqueeze(1), size=(fill_h, fill_w),
+                                    mode="nearest").squeeze(1)
+        if iters > 0:
+            if mode == 0:
+                valid = pos > 0
+                cols = torch.arange(pos.shape[-1], device=pos.device, dtype=torch.int64)
+                idx = torch.where(valid, cols.view(1, 1, -1),
+                                  torch.full_like(cols.view(1, 1, -1), -1))
+                idx = torch.cummax(idx, dim=-1).values
+                filled = torch.gather(pos, -1, idx.clamp(min=0))
+                pos = torch.where(idx >= 0, filled, pos)
+            elif mode == 1:
+                for _ in range(iters):
+                    inv = pos <= 0
+                    cand = F.max_pool2d(pos.unsqueeze(1), 3, 1, 1).squeeze(1)
+                    pos = torch.where(inv & (cand > 0), cand, pos)
+            else:
+                for _ in range(iters):
+                    inv = pos <= 0
+                    tmp = torch.where(pos > 0, pos, torch.full_like(pos, 1e6))
+                    cand = -F.max_pool2d((-tmp).unsqueeze(1), 3, 1, 1).squeeze(1)
+                    cand = torch.where(cand >= 1e6 - 1, torch.zeros_like(cand), cand)
+                    pos = torch.where(inv & (cand > 0), cand, pos)
+        return -pos
 
     def process_depth_batch(self, depth):
         # Batched equivalent of process_depth_image for the Warp path; `depth` is [N, H, W] in the Isaac negative-in-front convention.
@@ -661,6 +717,16 @@ class LeggedRobot(BaseTask):
         # First two steps of an episode: prefill every ring slot as the legacy path does (lag suppressed until the buffer refills).
         fresh = self.episode_length_buf <= 1
         active = due | fresh
+        # Partial fleet (cfg.depth.num_depth_envs): only the FIRST nd envs are ever
+        # rendered, so a big PPO batch (6144) can coexist with a small depth-BC
+        # subset (480) instead of paying N ray-casts for frames nobody consumes.
+        # Rows >= nd keep whatever their buffer held; every consumer must index
+        # the same prefix (t18 snapshots obs[:nd] / get_depth_obs()[:nd]).
+        nd = int(getattr(self.cfg.depth, "num_depth_envs", 0) or 0)
+        partial = 0 < nd < self.num_envs
+        if partial:
+            active = active.clone()
+            active[nd:] = False
         depth = self.warp_cam.render(
             self.root_states[:, :3], self.base_quat,
             body_pos=self.rigid_body_states[..., 0:3],
@@ -670,20 +736,24 @@ class LeggedRobot(BaseTask):
             active=active)                      # only these rows are valid
         # The post-process runs on the FULL batch on purpose: the degradation carries per-env temporal state (blind-spot random walk, drifting hole field) that must advance once per call.
         # Rows of envs that were not cast are computed and dropped; the rays are the cost.
-        new_frame = self.process_depth_batch(depth)
+        # With a partial fleet the batch IS the prefix, so the per-env state slices
+        # inside process_depth_batch (pw_bs_k[:N], _pw_low, depth_noise_scale[:N])
+        # still line up with rows 0..nd-1: those frames stay correct, the unused
+        # rows simply stop advancing.
+        m = nd if partial else depth.shape[0]
+        new_frame = self.process_depth_batch(depth[:m])
+        buf = self.depth_buffer[:m]
         # Masked writes, not index lists: avoids a per-step nonzero()/host sync in the rollout hot loop.
-        n_slots = self.depth_buffer.shape[1]
-        roll = active.view(-1, 1, 1)
+        n_slots = buf.shape[1]
+        roll = active[:m].view(-1, 1, 1)
         for s in range(n_slots - 1):            # shift older slots down one
-            self.depth_buffer[:, s] = torch.where(roll, self.depth_buffer[:, s + 1],
-                                                  self.depth_buffer[:, s])
-        self.depth_buffer[:, -1] = torch.where(roll, new_frame, self.depth_buffer[:, -1])
+            buf[:, s] = torch.where(roll, buf[:, s + 1], buf[:, s])
+        buf[:, -1] = torch.where(roll, new_frame, buf[:, -1])
         if n_slots > 1:
             # Fresh episodes: every slot holds the new frame, so no pre-reset frame can be served.
-            init = fresh.view(-1, 1, 1)
+            init = fresh[:m].view(-1, 1, 1)
             for s in range(n_slots - 1):
-                self.depth_buffer[:, s] = torch.where(init, new_frame,
-                                                      self.depth_buffer[:, s])
+                buf[:, s] = torch.where(init, new_frame, buf[:, s])
 
     def get_depth_obs(self):
         """The depth frame the policy/encoder consumes, with per-env camera
@@ -993,6 +1063,18 @@ class LeggedRobot(BaseTask):
         else:
             premature_wall = torch.zeros_like(wococo_env)
 
+        # Went around the plate instead of over it: term when the TRUNK's world x
+        # passes the backing wall's back face. Trunk, not feet, is what makes this
+        # safe -- a planted foot legitimately reaches the plate's top edge, which
+        # is one wall-thickness (0.35 m) in FRONT of that face, while the trunk
+        # stays ~0.3 m further back again. Tiles without a wall export 0.0.
+        behind_wall = torch.zeros_like(wococo_env)
+        if bool(getattr(self.cfg.env, 'terminate_behind_wall', True)):
+            _back_x = getattr(self, 'env_flyball_wall_back_x', None)
+            if _back_x is not None:
+                behind_wall = (wococo_env & (_back_x > 0.0)
+                               & (self.root_states[:, 0] > _back_x))
+
         # Latch first sentinel entry for post-plant roll and yaw grace periods.
         at_sentinel = self.wococo_contact_stage >= self._wococo_sentinel_stage
         newly_sentinel = at_sentinel & (self.wococo_sentinel_reached_step < 0)
@@ -1139,6 +1221,7 @@ class LeggedRobot(BaseTask):
         self.reset_buf |= lateral_cutoff
         self.reset_buf |= stage1_ground
         self.reset_buf |= stage2_overshoot
+        self.reset_buf |= behind_wall
 
         # Expose per-cause flags so reset_idx can log which termination actually fired.
         self.term_roll            = roll_cutoff
@@ -1153,6 +1236,7 @@ class LeggedRobot(BaseTask):
         self.term_yaw_tracking    = yaw_track_cutoff
         self.term_plant_dwell     = plant_dwell
         self.term_lateral         = lateral_cutoff
+        self.term_behind_wall     = behind_wall
         # Not a termination: the per-env mask of envs whose roll / pitch / base-contact kills were suppressed this step (logged as wococo/armed_term_exempt).
         self.wococo_armed_term_exempt = armed_term_exempt
 
@@ -1294,6 +1378,7 @@ class LeggedRobot(BaseTask):
             _c[self.term_lateral[env_ids]]        = 9
             _c[self.term_wococo_stage1_ground[env_ids]]    = 10
             _c[self.term_wococo_stage2_overshoot[env_ids]] = 11
+            _c[self.term_behind_wall[env_ids]]             = 12
             _c[self.term_roll[env_ids]]           = 1   # roll assigned last → wins ties (wall-plant cause)
             self.last_term_code[env_ids] = _c
         self.obs_history_buf[env_ids, :, :] = 0.  # reset obs history buffer TODO no 0s
@@ -1584,7 +1669,7 @@ class LeggedRobot(BaseTask):
         for key in ("term_roll", "term_pitch", "term_height",
                     "term_base_contact", "term_reach_goal", "term_timeout",
                     "term_yaw_tracking", "term_plant_dwell",
-                    "term_lateral"):
+                    "term_lateral", "term_behind_wall"):
             if hasattr(self, key):
                 self.extras["episode"][key] = getattr(self, key)[env_ids].float().mean()
         # Plant-failure early terminations, with the curriculum arm-latch state (0 until the fleet reaches the arm level).
@@ -2361,6 +2446,7 @@ class LeggedRobot(BaseTask):
         self.env_flyball_pit_mid = (self.env_flyball_pit_x0 + self.env_flyball_pit_x1) * 0.5
         self.env_flyball_forbidden_x0 = self.terrain_flyball_forbidden_x0[self.terrain_levels, self.terrain_types]
         self.env_flyball_forbidden_x1 = self.terrain_flyball_forbidden_x1[self.terrain_levels, self.terrain_types]
+        self.env_flyball_wall_back_x = self.terrain_flyball_wall_back_x[self.terrain_levels, self.terrain_types]
         self.env_flyball_wall_angle_deg  = self.terrain_flyball_wall_angle_deg[self.terrain_levels, self.terrain_types]
         self.env_flyball_wall_delta_z    = self.terrain_flyball_wall_delta_z[self.terrain_levels, self.terrain_types]
         self.env_flyball_liftoff_region  = self.terrain_flyball_liftoff_region[self.terrain_levels, self.terrain_types]
@@ -2416,6 +2502,9 @@ class LeggedRobot(BaseTask):
             self.terrain_levels, self.terrain_types
         ]
         self.env_flyball_forbidden_x1 = self.terrain_flyball_forbidden_x1[
+            self.terrain_levels, self.terrain_types
+        ]
+        self.env_flyball_wall_back_x = self.terrain_flyball_wall_back_x[
             self.terrain_levels, self.terrain_types
         ]
         self.env_flyball_wall_angle_deg = self.terrain_flyball_wall_angle_deg[
@@ -2845,6 +2934,18 @@ class LeggedRobot(BaseTask):
                                             self.cfg.depth.buffer_len,
                                             self.cfg.depth.resized[1],
                                             self.cfg.depth.resized[0]).to(self.device)
+            # Partial-fleet capture (t18 path B): only rows < nd render, which is
+            # only possible when each env is cast on its own due step.
+            _nd = int(getattr(self.cfg.depth, "num_depth_envs", 0) or 0)
+            if 0 < _nd < self.num_envs:
+                if not self._depth_on_demand():
+                    raise ValueError("cfg.depth.num_depth_envs < num_envs requires "
+                                     "cfg.depth.render_on_demand = True (use_warp, "
+                                     "capture_interval == 1): the eager path casts "
+                                     "the whole fleet every capture step, so a "
+                                     "subset would not save any ray")
+                print(f"[depth] partial-fleet capture: envs 0..{_nd - 1} of "
+                      f"{self.num_envs} render; rows >= {_nd} hold unused frames")
             if self._warp_enabled():
                 from legged_gym.utils.warp_cam import WarpDepthCamera
                 if not hasattr(self.terrain, "vertices"):
@@ -3183,6 +3284,7 @@ class LeggedRobot(BaseTask):
             self.terrain_flyball_pit_x1 = torch.from_numpy(self.terrain.flyball_pit_x1).to(self.device).to(torch.float)
             self.terrain_flyball_forbidden_x0 = torch.from_numpy(self.terrain.flyball_forbidden_x0).to(self.device).to(torch.float)
             self.terrain_flyball_forbidden_x1 = torch.from_numpy(self.terrain.flyball_forbidden_x1).to(self.device).to(torch.float)
+            self.terrain_flyball_wall_back_x = torch.from_numpy(self.terrain.flyball_wall_back_x).to(self.device).to(torch.float)
             self.terrain_flyball_wall_angle_deg = torch.from_numpy(self.terrain.flyball_wall_angle_deg).to(self.device).float()
             self.terrain_flyball_wall_delta_z   = torch.from_numpy(self.terrain.flyball_wall_delta_z).to(self.device).float()
             self.terrain_flyball_liftoff_region = torch.from_numpy(self.terrain.flyball_liftoff_region).to(self.device).float()
@@ -3212,6 +3314,7 @@ class LeggedRobot(BaseTask):
             self.env_flyball_pit_mid = (self.env_flyball_pit_x0 + self.env_flyball_pit_x1) * 0.5
             self.env_flyball_forbidden_x0 = self.terrain_flyball_forbidden_x0[self.terrain_levels, self.terrain_types]
             self.env_flyball_forbidden_x1 = self.terrain_flyball_forbidden_x1[self.terrain_levels, self.terrain_types]
+            self.env_flyball_wall_back_x = self.terrain_flyball_wall_back_x[self.terrain_levels, self.terrain_types]
             self.env_flyball_wall_angle_deg  = self.terrain_flyball_wall_angle_deg[self.terrain_levels, self.terrain_types]
             self.env_flyball_wall_delta_z    = self.terrain_flyball_wall_delta_z[self.terrain_levels, self.terrain_types]
             self.env_flyball_liftoff_region  = self.terrain_flyball_liftoff_region[self.terrain_levels, self.terrain_types]

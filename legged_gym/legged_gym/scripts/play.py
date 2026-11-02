@@ -105,6 +105,7 @@ TERM_CODE_NAMES = {
     9: "lateral",
     10: "wococo_stage1_ground",
     11: "wococo_stage2_overshoot",
+    12: "behind_wall",
 }
 
 

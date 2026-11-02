@@ -290,9 +290,12 @@ class OnPolicyRunner:
     def _depth_tick(self, obs, frame):
         """One depth-encoder tick: 10 Hz, i.e. once per cfg.depth.update_interval steps.
 
-        Returns (latent, frame, hidden_before). The (frame, hidden-before) pair is what
-        every transition caches — the 50 Hz steps in between reuse the tick's latent,
-        exactly as play.py does — so PPO can replay the same encoder call per sample.
+        Returns (latent, frame, hidden_before, prop). The (frame, hidden-before, prop)
+        triple is what every transition caches — the 50 Hz steps in between reuse the
+        tick's latent, exactly as play.py does — so PPO can replay the same encoder
+        call per sample. prop must be carried along: on the intermediate steps the
+        encoder never saw the current proprio, so replaying from it would rebuild a
+        different latent than the one the action was actually taken with.
         """
         enc = self.alg.depth_encoder
         if enc.hidden_states is None:
@@ -305,7 +308,7 @@ class OnPolicyRunner:
         prop[:, 6:8] = 0.0   # deploy blanks the heading slots: depth is the only heading cue
         with torch.no_grad():
             latent = enc(frame.clone(), prop)
-        return latent, frame, hidden_before
+        return latent, frame, hidden_before, prop
 
     def learn_depth_ppo(self, num_learning_iterations, init_at_random_ep_len=False):
         """Single-stage camera policy: student observations, teacher rewards.
@@ -338,7 +341,7 @@ class OnPolicyRunner:
         # it (None in between => the cached tick pair is reused, 10 Hz encoder cadence).
         infos["depth"] = (self.env.get_depth_obs().to(self.device)
                           if self.if_depth else None)
-        depth_latent, depth_frame, depth_hidden = None, None, None
+        depth_latent, depth_frame, depth_hidden, depth_prop = None, None, None, None
         self.alg.actor_critic.train()
         self.alg.depth_encoder.train()
 
@@ -363,7 +366,7 @@ class OnPolicyRunner:
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
                     if infos["depth"] is not None:
-                        depth_latent, depth_frame, depth_hidden = self._depth_tick(
+                        depth_latent, depth_frame, depth_hidden, depth_prop = self._depth_tick(
                             obs, infos["depth"])
                     if depth_latent is None:
                         raise RuntimeError(
@@ -372,7 +375,8 @@ class OnPolicyRunner:
                     actions = self.alg.act(obs, critic_obs, infos, hist_encoding=True,
                                            depth_latent=depth_latent,
                                            depth_img=depth_frame,
-                                           depth_hidden=depth_hidden)
+                                           depth_hidden=depth_hidden,
+                                           depth_prop=depth_prop)
                     obs, privileged_obs, rewards, dones, infos = self.env.step(actions)  # obs has changed to next_obs !! if done obs has been reset
                     critic_obs = privileged_obs if privileged_obs is not None else obs
                     obs, critic_obs, rewards, dones = obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
@@ -412,8 +416,6 @@ class OnPolicyRunner:
             learn_time = stop - start
             if self.log_dir is not None:
                 self.log(locals())
-                print(f"{'Depth aux scan loss:':>35} {self.alg.last_depth_aux_loss:.4f}"
-                      f"   (encoder lr {self.alg.optimizer.param_groups[-1]['lr']:.1e})")
             if it < 2500:
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
@@ -655,7 +657,14 @@ class OnPolicyRunner:
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs['collection_time'] + locs['learn_time']))
 
-        wandb_dict['Loss/value_function'] = ['mean_value_loss']
+        # Was `['mean_value_loss']` -- a literal list, so wandb received a string and
+        # the critic's loss was never actually recorded on any run.
+        wandb_dict['Loss/value_function'] = locs['mean_value_loss']
+        # Critic health. A small value loss cannot be told apart from a flat one from
+        # the loss alone; the explained variance can (1 = perfect, 0 = no better than
+        # predicting the batch mean, < 0 = worse).
+        wandb_dict['Loss/value_explained_var'] = getattr(
+            self.alg, 'last_explained_var', float('nan'))
         wandb_dict['Loss/surrogate'] = locs['mean_surrogate_loss']
         wandb_dict['Loss/estimator'] = locs['mean_estimator_loss']
         wandb_dict['Loss/hist_latent_loss'] = locs['mean_hist_latent_loss']
@@ -668,10 +677,34 @@ class OnPolicyRunner:
         # can't distinguish "KL on target" from "KL pinned way above target".
         wandb_dict['Loss/kl_mean'] = getattr(self.alg, 'last_kl_mean', float('nan'))
         wandb_dict['Loss/lr_floor_frac'] = getattr(self.alg, 'last_lr_floor_frac', float('nan'))
+        # Rollout/replay agreement of the camera latent, measured with the parameters
+        # untouched. It must sit at float noise (~1e-4): anything larger means the
+        # encoder is replayed on inputs it never saw during the rollout, so every PPO
+        # ratio is measured against a policy that never existed -- which the KL-adaptive
+        # schedule reads as "the step was too big" and drains the lr into its floor.
+        wandb_dict['Loss/kl_replay'] = getattr(self.alg, 'last_replay_kl', float('nan'))
+        # Depth PPO only: how closely the camera latent tracks the privileged scan
+        # latent it is anchored to. NaN on the other paths.
+        wandb_dict['Loss/depth_aux_scan'] = getattr(
+            self.alg, 'last_depth_aux_loss', float('nan'))
+        # Pre-clip gradient split between the two parameter groups that share ONE
+        # clip_grad_norm_: a dominant encoder starves the actor's update.
+        wandb_dict['Loss/grad_norm_policy'] = getattr(
+            self.alg, 'last_grad_norm_policy', float('nan'))
+        wandb_dict['Loss/grad_norm_depth'] = getattr(
+            self.alg, 'last_grad_norm_depth', float('nan'))
+        wandb_dict['Loss/encoder_lr'] = (
+            self.alg.learning_rate * self.alg.depth_encoder_lr_ratio
+            if getattr(self.alg, 'train_depth_ppo', False) else float('nan'))
         wandb_dict['Loss/discriminator'] = locs['mean_disc_loss']
         wandb_dict['Loss/discriminator_accuracy'] = locs['mean_disc_acc']
 
         wandb_dict['Policy/mean_noise_std'] = mean_std.item()
+        # Rollout length per iteration. Task configs derive it differently
+        # (depth_encoder.num_steps_per_env = update_interval * 24 vs the runner's own
+        # 24), so "seconds per iteration" is NOT comparable across tasks unless this
+        # sits on the same chart.
+        wandb_dict['Perf/steps_per_iteration'] = self.num_steps_per_env
         wandb_dict['Perf/total_fps'] = fps
         wandb_dict['Perf/collection time'] = locs['collection_time']
         wandb_dict['Perf/learning_time'] = locs['learn_time']
@@ -717,6 +750,18 @@ class OnPolicyRunner:
                         #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
                         #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
 
+        # Health line shared by every path: one glance says whether the lr schedule is
+        # reacting to real policy change or to replay error, whether the critic is
+        # actually fitting, and which parameter group is eating the clip budget.
+        log_string += (f"""{'lr (policy/encoder):':>{pad}} {self.alg.learning_rate:.2e}/"""
+                       f"""{wandb_dict['Loss/encoder_lr']:.2e}\n"""
+                       f"""{'KL (sched/replay):':>{pad}} {wandb_dict['Loss/kl_mean']:.4f}/"""
+                       f"""{wandb_dict['Loss/kl_replay']:.4f}\n"""
+                       f"""{'Value explained var:':>{pad}} {wandb_dict['Loss/value_explained_var']:.3f}\n"""
+                       f"""{'Grad norm (policy/depth):':>{pad}} {wandb_dict['Loss/grad_norm_policy']:.2f}/"""
+                       f"""{wandb_dict['Loss/grad_norm_depth']:.2f}\n"""
+                       f"""{'Depth aux scan loss:':>{pad}} {wandb_dict['Loss/depth_aux_scan']:.4f}\n"""
+                       f"""{'Steps per iteration:':>{pad}} {self.num_steps_per_env}\n""")
         log_string += f"""{'-' * width}\n"""
         log_string += ep_string
         curr_it = locs['it'] - self.start_learning_iteration

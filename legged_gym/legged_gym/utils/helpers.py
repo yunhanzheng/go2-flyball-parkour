@@ -141,6 +141,8 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             env_cfg.depth.use_camera = args.use_camera
         if getattr(args, "depth_hole_fill", False):
             env_cfg.depth.hole_fill = True
+        if getattr(args, "hole_fill_backend", None):
+            env_cfg.depth.hole_fill_backend = args.hole_fill_backend
         if getattr(args, "raw_depth", False):
             # Raw policy input: keep only crop/resize/normalization.
             env_cfg.depth.dis_noise = 0.0
@@ -270,6 +272,15 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             cfg_train.algorithm.priv_reg_coef_schedual = cfg_train.algorithm.priv_reg_coef_schedual_resume
         # The CLI flag is an opt-out so the default recipe (encoder L2 ON) is kept.
         cfg_train.depth_encoder.use_depth_encoder_loss = not bool(getattr(args, "no_depth_encoder_loss", False))
+        if getattr(args, "aux_scan_coef", None) is not None:
+            _aux_old = float(cfg_train.depth_encoder.aux_scan_coef)
+            cfg_train.depth_encoder.aux_scan_coef = float(args.aux_scan_coef)
+            print(f"[train] --aux_scan_coef: {_aux_old:g} -> {args.aux_scan_coef:g} "
+                  f"(0 = the encoder is driven by the PPO gradient only)")
+        if getattr(args, "depth_encoder_lr", None) is not None:
+            cfg_train.depth_encoder.learning_rate = float(args.depth_encoder_lr)
+            print(f"[train] --depth_encoder_lr: {args.depth_encoder_lr:.2e} "
+                  f"(policy lr {cfg_train.algorithm.learning_rate:.2e})")
         if args.experiment_name is not None:
             cfg_train.runner.experiment_name = args.experiment_name
         if args.run_name is not None:
@@ -298,6 +309,8 @@ def get_args():
         {"name": "--seed", "type": int, "help": "Random seed. Overrides config file if provided."},
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
         {"name": "--learning_rate", "type": float, "default": None, "help": "Policy learning rate (algorithm.learning_rate). depth_encoder.learning_rate is kept as-is — it is a separate parameter group, and the adaptive schedule rescales both proportionally."},
+        {"name": "--depth_encoder_lr", "type": float, "default": None, "help": "Override depth_encoder.learning_rate (default 1e-3). Under depth PPO it is a separate parameter group inside the PPO optimizer; with --aux_scan_coef 0 the latent has no anchor, so a large step here is the difference between 'drifts slowly' and 'falls apart'."},
+        {"name": "--aux_scan_coef", "type": float, "default": None, "help": "Override depth_encoder.aux_scan_coef (default 1.0). 0 disables the MSE(depth latent, stop-grad scan latent) anchor, leaving the encoder trained by the PPO gradient alone."},
         {"name": "--num_learning_epochs", "type": int, "default": None, "help": "algorithm.num_learning_epochs. On the go2_depth path every epoch replays the depth encoder over the rollout, so this is the main throughput knob."},
         {"name": "--num_mini_batches", "type": int, "default": None, "help": "algorithm.num_mini_batches. Together with --num_learning_epochs it sets how many CNN replays PPO.update does per iteration."},
         {"name": "--schedule", "type": str, "default": None, "help": "algorithm.schedule: 'adaptive' (default) or 'fixed'. The adaptive controller checks KL PER MINIBATCH and pins the lr at --lr_floor once the depth latent starts drifting, so 'fixed' is the escape hatch when learning stalls."},
@@ -318,6 +331,9 @@ def get_args():
          "help": "apply deployment-compatible RealSense hole fill as the final depth preprocessing step"},
         {"name": "--no_depth_hole_fill", "action": "store_true", "default": False,
          "help": "disable only deployment-compatible depth hole filling; keep other camera/PW effects"},
+        {"name": "--hole_fill_backend", "type": str, "default": None, "choices": ["cpu", "gpu"],
+         "help": "which hole-fill implementation to run; the two are bit-identical, gpu only avoids the "
+                 "device->host->device round trip and the 8 numpy dilate passes"},
         {"name": "--save_depth_stages", "action": "store_true", "default": False,
          "help": "save raw/noisy/filled/final depth stages once per second during play"},
         {"name": "--depth_stage_fps", "type": float, "default": 1.0,

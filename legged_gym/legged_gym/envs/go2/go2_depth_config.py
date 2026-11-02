@@ -50,11 +50,20 @@ class Go2DepthCfg(Go2StudentCfg):
         terminate_on_yaw_tracking = False
 
     class terrain(Go2StudentCfg.terrain):
-        # Cold start: every env spawns on row 0. Promotion then climbs the same
-        # curriculum the teacher used (rows 4+ add the hurdles), and demotion is left on
-        # because it is the only thing that pulls a collapsed fleet back down.
-        min_terrain_level = 0
-        max_init_terrain_level = 0
+        # Floor raised to the student's band. flyball_single_hurdle_zero_below_level = 4
+        # zeroes BOTH hurdle slots on rows 0-3, so a floor of 0 does not just soften the
+        # curriculum, it deletes the task: measured on the two runs that used it,
+        # rew_hurdle_clearance was nonzero 0/5234 iters (stage4-480-l5) and 0/15000
+        # (stage5-noaux-scratch), with terrain_level pinned at 0.000. v3-student, which
+        # trains from 4, had it nonzero 5202/5217 iters at terrain_level 4.00-4.83.
+        # resample_min_level is already 4 (inherited), so a 0 here was also internally
+        # inconsistent: envs promoted past the top were resampled into rows with bars
+        # while failing envs were demoted into rows without any.
+        # Ceiling stays at 5 to match the student. Note the curriculum still rarely
+        # climbs (distance rule: promote > 0.8*cmd_x*20 s ~ 16*cmd_x m against a ~4 m
+        # corridor), so this floor is the de-facto training difficulty.
+        min_terrain_level = 4
+        max_init_terrain_level = 5
         no_demotion = False
 
     class depth(Go2StudentCfg.depth):
