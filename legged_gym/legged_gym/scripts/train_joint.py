@@ -275,7 +275,8 @@ def main():
         nrow = env_cfg.terrain.num_rows
         mean_lvl = lvl.mean().item()
         print(f"[joint] iter {it:4d} | act_err={act_err:.4f} lat_err={lat_err:.4f} | value={mv:.4f} "
-              f"surr={ms:.4f} est={me:.4f} lr={alg.learning_rate:.2e} "
+              f"surr={ms:.4f} est={me:.4f} ev={getattr(alg, 'last_explained_var', float('nan')):.3f} "
+              f"kl={getattr(alg, 'last_kl_mean', float('nan')):.4f} lr={alg.learning_rate:.2e} "
               f"LVL mean={mean_lvl:.2f} max={int(lvl.max().item())} "
               f"top%={100.0 * (lvl >= nrow - 1).float().mean().item():.0f} "
               f"| t={time.time() - t0:.1f}s [roll={t_roll:.2f} bc={t_bc:.2f} upd={t_upd:.2f}]",
@@ -286,7 +287,16 @@ def main():
                      ('curriculum/frac_row_ge_7', (lvl >= 7).float().mean().item()),
                      ('bc/act_err', act_err), ('bc/lat_err', lat_err),
                      ('bc/enc_loss_scale', ex.act_w + ex.lat_w),
-                     ('ppo/value_loss', mv), ('ppo/surr', ms), ('ppo/explained_var', me),
+                     ('ppo/value_loss', mv), ('ppo/surr', ms),
+                     # `me` is the THIRD return of alg.update() = mean_estimator_loss
+                     # (ppo.py returns value, surrogate, estimator, disc, disc_acc, ...).
+                     # The real explained variance lives on alg.last_explained_var, so the
+                     # two are logged apart instead of sharing one mislabelled tag.
+                     ('ppo/estimator_loss', me),
+                     ('ppo/explained_var', getattr(alg, 'last_explained_var', float('nan'))),
+                     ('ppo/kl_mean', getattr(alg, 'last_kl_mean', float('nan'))),
+                     ('ppo/lr_floor_frac', getattr(alg, 'last_lr_floor_frac', float('nan'))),
+                     ('policy/action_std', ac.std.mean().item()),
                      ('ppo/lr', alg.learning_rate), ('perf/iter_time', time.time() - t0)]:
             writer.add_scalar(k, v, it)
         ep = infos.get('episode') if isinstance(infos, dict) else None
