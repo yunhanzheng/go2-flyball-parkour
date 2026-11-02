@@ -201,7 +201,12 @@ def main():
 
     def bc_tick(obs_snap, frame):
         """One encoder update from a (obs, frame) snapshot pair taken during the rollout."""
-        scan_lat = ac.actor.infer_scandots_latent(obs_snap)
+        # detach: this is the BC TARGET, so it must not keep a graph. Today the actor
+        # freeze a few lines below is what actually stops the leak, which means moving
+        # that freeze (or freezing only part of the actor) would silently start backpropa-
+        # gating the latent-consistency term into the scan encoder as well. Numerically a
+        # no-op; it just removes the dependency on statement order.
+        scan_lat = ac.actor.infer_scandots_latent(obs_snap).detach()
         a_t = ac.act_inference(obs_snap, hist_encoding=False, scandots_latent=None).detach()
         op = obs_snap.clone()
         op[:, 6:8] = 0.0                      # heading commands are not resolvable from depth
