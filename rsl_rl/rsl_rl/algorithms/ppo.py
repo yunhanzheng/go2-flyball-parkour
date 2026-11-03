@@ -95,6 +95,13 @@ class PPO:
                  device='cpu',
                  dagger_update_freq=20,
                  priv_reg_coef_schedual = [0, 0, 0],
+                 # Dual-encoder consistency loss parameters
+                 use_dual_encoder=False,
+                 consistency_loss_weight=0.1,
+                 height_decay_trigger_success_rate=0.5,
+                 height_decay_trigger_mean_level=2,
+                 height_decay_trigger_consistency=0.1,
+                 height_decay_rate=0.995,
                  **kwargs
                  ):
 
@@ -208,6 +215,26 @@ class PPO:
                 self.depth_actor = depth_actor
                 self.depth_actor_optimizer = optim.Adam([*self.depth_actor.parameters(), *self.depth_encoder.parameters()], lr=depth_encoder_paras["learning_rate"])
 
+        # Dual-encoder consistency loss initialization
+        self.use_dual_encoder = use_dual_encoder
+        if self.use_dual_encoder:
+            self.consistency_loss_weight = consistency_loss_weight
+            self.height_decay_trigger_success_rate = height_decay_trigger_success_rate
+            self.height_decay_trigger_mean_level = height_decay_trigger_mean_level
+            self.height_decay_trigger_consistency = height_decay_trigger_consistency
+            self.height_decay_rate = height_decay_rate
+            
+            # EMA trackers for adaptive decay
+            self.success_rate_ema = 0.0
+            self.consistency_ema = 1.0  # Start high, decay as latent alignment improves
+            self.ema_alpha = 0.95  # EMA smoothing factor
+            
+            print(f"[ppo] dual-encoder mode: consistency_loss_weight={consistency_loss_weight}, "
+                  f"decay_triggers=(success>={height_decay_trigger_success_rate}, "
+                  f"level>={height_decay_trigger_mean_level}, "
+                  f"consistency<{height_decay_trigger_consistency}), "
+                  f"decay_rate={height_decay_rate}")
+
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
         self.storage = RolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape,  critic_obs_shape, action_shape, self.device)
 
@@ -283,7 +310,14 @@ class PPO:
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
         # Compute the actions and values, use proprio to compute estimated priv_states then actions, but store true priv_states
-        if depth_latent is not None:
+        if self.use_dual_encoder and depth_latent is not None:
+            # Dual-encoder mode: actor sees both height scan (via scandots_latent=None) and depth latent
+            # Height scan goes through the actor's OWN scan_encoder, depth latent is concatenated
+            self.transition.actions = self.actor_critic.act(
+                obs, hist_encoding,
+                scandots_latent=None,  # Use height scan encoder internally
+                depth_latent=depth_latent).detach()
+        elif depth_latent is not None:
             # Depth PPO: the actor is driven by the camera latent in place of the height
             # scan, on the deployable observation built by depth_actor_obs().
             self.transition.actions = self.actor_critic.act(
@@ -462,6 +496,21 @@ class PPO:
                        priv_reg_coef * priv_reg_loss
                 if depth_aux_loss is not None:
                     loss = loss + self.depth_aux_scan_coef * depth_aux_loss
+                
+                # Dual-encoder consistency loss
+                if self.use_dual_encoder and depth_latent is not None:
+                    # Compute height latent from scan encoder
+                    with torch.no_grad():
+                        height_latent = self.actor_critic.actor.infer_scandots_latent(obs_batch)
+                    # Consistency loss: ||latent_h - latent_d||_2
+                    consistency_loss = torch.nn.functional.mse_loss(height_latent, depth_latent)
+                    loss = loss + self.consistency_loss_weight * consistency_loss
+                    
+                    # Update EMA for adaptive decay
+                    self.consistency_ema = self.ema_alpha * self.consistency_ema + (1 - self.ema_alpha) * consistency_loss.item()
+                    
+                    # Adaptive height weight decay based on triple conditions
+                    self._update_height_weight_decay(info)
                 # loss = self.teacher_alpha * imitation_loss + (1 - self.teacher_alpha) * loss
 
                 # Gradient step
@@ -623,3 +672,39 @@ class PPO:
             reward = reward.mean(dim=1)  # (b1,)
         reward = torch.log(reward + 1.0)
         return reward
+
+    def _update_height_weight_decay(self, info):
+        """Adaptive height weight decay based on triple conditions:
+        1. Success rate >= threshold
+        2. Mean terrain level >= threshold  
+        3. Latent consistency < threshold
+        """
+        if not self.use_dual_encoder:
+            return
+        
+        # Extract metrics from info dict
+        success_rate = info.get('success_rate', 0.0)
+        mean_level = info.get('mean_level', 0.0)
+        
+        # Update success rate EMA
+        self.success_rate_ema = self.ema_alpha * self.success_rate_ema + (1 - self.ema_alpha) * success_rate
+        
+        # Check triple conditions
+        can_decay = (
+            self.success_rate_ema >= self.height_decay_trigger_success_rate and
+            mean_level >= self.height_decay_trigger_mean_level and
+            self.consistency_ema < self.height_decay_trigger_consistency
+        )
+        
+        # Apply decay if conditions met
+        if can_decay and self.actor_critic.actor.height_weight > 0:
+            old_weight = self.actor_critic.actor.height_weight
+            self.actor_critic.actor.height_weight *= self.height_decay_rate
+            new_weight = self.actor_critic.actor.height_weight
+            
+            # Log decay event (first time per update)
+            if not hasattr(self, '_last_decay_log') or self._last_decay_log != self.counter:
+                print(f"[ppo] height_weight decay: {old_weight:.4f} -> {new_weight:.4f} "
+                      f"(success={self.success_rate_ema:.3f}, level={mean_level:.1f}, "
+                      f"consistency={self.consistency_ema:.4f})")
+                self._last_decay_log = self.counter

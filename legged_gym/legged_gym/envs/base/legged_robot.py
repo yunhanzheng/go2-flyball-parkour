@@ -924,6 +924,23 @@ class LeggedRobot(BaseTask):
     def reindex(self, vec):
         return vec[:, [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]]
 
+    def _frontier_mean_level(self):
+        """Compute mean level excluding the bottom random_level_frac of envs.
+        
+        The 20% random-level envs are uniformly scattered across [0, mean_level],
+        dragging the fleet mean down. This helper sorts envs by level and computes
+        the mean of the top (1 - random_level_frac), giving a cleaner signal of
+        actual curriculum progress.
+        """
+        frac = float(getattr(self.cfg.terrain, 'random_level_frac', 0.0))
+        if frac <= 0.0:
+            return self.terrain_levels.float().mean()
+        
+        sorted_levels, _ = self.terrain_levels.sort(descending=True)
+        n_frontier = int((1.0 - frac) * len(sorted_levels))
+        n_frontier = max(n_frontier, 1)  # at least 1 env
+        return sorted_levels[:n_frontier].float().mean()
+
     def _update_soft_curriculum_latches(self):
         """Trigger and advance sticky wall/clearance curriculum ramps once/step."""
         evaluation_mode = bool(getattr(self, "evaluation_mode", False))
@@ -932,7 +949,7 @@ class LeggedRobot(BaseTask):
         def _mean_level():
             nonlocal mean_level
             if mean_level is None:
-                mean_level = float(self.terrain_levels.float().mean())
+                mean_level = float(self._frontier_mean_level())
             return mean_level
 
         term_enabled = bool(getattr(
@@ -1003,6 +1020,17 @@ class LeggedRobot(BaseTask):
             lat_thresh = float(getattr(self.cfg.env, 'lateral_deviation_term_m', 1.5))
             lateral_dev = torch.abs(self.root_states[:, 1] - self.env_origins[:, 1])
             lateral_cutoff = lateral_dev > lat_thresh
+
+        # Low-velocity termination (opt-in via cfg.env.terminate_on_low_velocity): terminate when |vel_x| stays below threshold for too many consecutive steps.
+        # Useful for detecting when the robot stalls in front of an obstacle (e.g., hurdle or wall) and stops making progress.
+        low_vel_cutoff = torch.zeros_like(roll_cutoff)
+        if bool(getattr(self.cfg.env, 'terminate_on_low_velocity', False)):
+            vel_thresh = float(getattr(self.cfg.env, 'low_velocity_term_mps', 0.1))
+            dur_steps = int(getattr(self.cfg.env, 'low_velocity_term_duration_steps', 50))  # default 2s @ 25Hz
+            vel_x = torch.abs(self.root_states[:, 7])  # linear velocity x
+            is_slow = vel_x < vel_thresh
+            self.low_vel_steps = torch.where(is_slow, self.low_vel_steps + 1, torch.zeros_like(self.low_vel_steps))
+            low_vel_cutoff = self.low_vel_steps >= dur_steps
 
         # Yaw-tracking termination (distillation only): once the student's heading drifts too far from the oracle heading the teacher's labels stop being trustworthy, so cut the episode before it corrupts the DAgger dataset.
         # Computed fresh here (NOT self.delta_yaw, which is unwrapped and refreshed every 5 steps) and wrap_to_pi'd so the heading flip at the wall turn doesn't trip a false positive. Gated on use_camera.
@@ -1109,10 +1137,10 @@ class LeggedRobot(BaseTask):
         # Both triggers are hard failures (reset_buf, NOT time_out); env_class 19/15 only.
         stage1_ground    = torch.zeros_like(wococo_env)
         stage2_overshoot = torch.zeros_like(wococo_env)
-        # Curriculum latch: hold both terminations off until the fleet-average terrain level first reaches the arm threshold; once armed it stays armed.
+        # Curriculum latch: hold both terminations off until the frontier-mean terrain level first reaches the arm threshold; once armed it stays armed.
         if not self.wococo_plant_fail_term_armed:
             arm_level = float(getattr(self.cfg.rewards, 'wococo_plant_fail_term_arm_mean_level', 4.0))
-            if self.terrain_levels.float().mean() >= arm_level:
+            if self._frontier_mean_level() >= arm_level:
                 self.wococo_plant_fail_term_armed = True
                 self.wococo_plant_fail_arm_step = self.common_step_counter
         # Optional ramp on the arming, which is otherwise a STEP that hands every env two instant-death conditions at once. Measured cost of that step (E02): term_stage1_ground 0.000 -> 0.377 within ~40 updates and fleet level 3.95 -> 3.16.
@@ -1219,6 +1247,7 @@ class LeggedRobot(BaseTask):
         self.reset_buf |= yaw_track_cutoff
         self.reset_buf |= plant_dwell
         self.reset_buf |= lateral_cutoff
+        self.reset_buf |= low_vel_cutoff
         self.reset_buf |= stage1_ground
         self.reset_buf |= stage2_overshoot
         self.reset_buf |= behind_wall
@@ -1236,6 +1265,7 @@ class LeggedRobot(BaseTask):
         self.term_yaw_tracking    = yaw_track_cutoff
         self.term_plant_dwell     = plant_dwell
         self.term_lateral         = lateral_cutoff
+        self.term_low_vel         = low_vel_cutoff
         self.term_behind_wall     = behind_wall
         # Not a termination: the per-env mask of envs whose roll / pitch / base-contact kills were suppressed this step (logged as wococo/armed_term_exempt).
         self.wococo_armed_term_exempt = armed_term_exempt
@@ -1270,7 +1300,7 @@ class LeggedRobot(BaseTask):
         _latch_at = getattr(self.cfg.domain_rand, "action_delay_latch_mean_level", None)
         if (not self.action_delay_latched and self.cfg.domain_rand.action_delay
                 and (_latch_step is not None or _latch_at is not None)):
-            _mean_level = self.terrain_levels.float().mean()
+            _mean_level = self._frontier_mean_level()
             if _latch_step is not None:
                 _fire = evaluation_mode or self.common_step_counter >= int(_latch_step)
                 _why = f"step {self.common_step_counter} >= {int(_latch_step)}"
@@ -1299,7 +1329,7 @@ class LeggedRobot(BaseTask):
         if getattr(self.cfg.domain_rand, "dr_lock_to_terrain_level", False):
             s_lo, s_hi = self.cfg.domain_rand.dr_scale_range
             if getattr(self.cfg.domain_rand, "dr_ramp_use_mean_level", False):
-                mean_level = self.terrain_levels.float().mean()
+                mean_level = self._frontier_mean_level()
                 # Ignore the initial level spread until a cold fleet first demotes.
                 if not self.dr_ramp_armed and mean_level < float(getattr(self.cfg.domain_rand, "dr_ramp_arm_below_mean_level", 0.5)):
                     self.dr_ramp_armed = True
@@ -1350,6 +1380,19 @@ class LeggedRobot(BaseTask):
                 _t = 2. + (_t - 2.) * self.dr_scale[env_ids].unsqueeze(-1)
             self.contact_thresh[env_ids] = _t
             self.last_contacts_obs[env_ids] = False
+
+        # Anti-forgetting: randomly sample level in [0, mean_level] for a fraction of envs.
+        # Using mean_level (not max_level_seen) keeps random envs within the fleet's
+        # demonstrated capability, making the "review" more effective.
+        _random_frac = float(getattr(self.cfg.terrain, 'random_level_frac', 0.0))
+        if _random_frac > 0.0 and self.max_level_seen > 0 and not evaluation_mode:
+            _mask = torch.rand(len(env_ids), device=self.device) < _random_frac
+            _n_random = int(_mask.sum())
+            if _n_random > 0:
+                _mean_lvl = int(self.terrain_levels.float().mean().item())
+                _upper = max(_mean_lvl, 0)
+                _random_levels = torch.randint(0, _upper + 1, (_n_random,), device=self.device)
+                self.terrain_levels[env_ids[_mask]] = _random_levels
 
         self._reset_dofs(env_ids)
         self._reset_root_states(env_ids)
@@ -1560,6 +1603,8 @@ class LeggedRobot(BaseTask):
         self.hurdle_sym_fired[env_ids]                 = False
         # A fresh episode starting in the timed initial standstill must ramp in from 1.0, not inherit the previous episode's held count.
         self.standstill_hold_steps[env_ids]            = 0
+        # Low-velocity termination counter: fresh episode starts with zero stall duration.
+        self.low_vel_steps[env_ids]                    = 0
 
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
@@ -2313,12 +2358,15 @@ class LeggedRobot(BaseTask):
         if self.custom_origins:
             self.root_states[env_ids] = self.base_init_state
             self.root_states[env_ids, :3] += self.env_origins[env_ids]
+            # Apply spawn x offset if configured (positive = toward wall)
+            _spawn_offset = float(getattr(self.cfg.env, 'spawn_x_offset', 0.0))
+            if _spawn_offset != 0.0:
+                self.root_states[env_ids, 0] += _spawn_offset
             if self.cfg.env.randomize_start_pos:
                 self.root_states[env_ids, :2] += torch_rand_float(-0.3, 0.3, (len(env_ids), 2), device=self.device) # xy position within 1m of the center
             if self.cfg.env.randomize_start_yaw:
-                _yaw_scale = (self.terrain_levels[env_ids].float()
-                              / max(self.max_terrain_level - 1, 1)).clamp(0., 1.)
-                rand_yaw = self.cfg.env.rand_yaw_range * _yaw_scale * torch_rand_float(-1, 1, (len(env_ids), 1), device=self.device).squeeze(1)
+                # Fixed yaw range (no terrain-level scaling)
+                rand_yaw = self.cfg.env.rand_yaw_range * torch_rand_float(-1, 1, (len(env_ids), 1), device=self.device).squeeze(1)
                 if self.cfg.env.randomize_start_pitch:
                     rand_pitch = self.cfg.env.rand_pitch_range*torch_rand_float(-1, 1, (len(env_ids), 1), device=self.device).squeeze(1)
                 else:
@@ -2392,6 +2440,28 @@ class LeggedRobot(BaseTask):
         goal_move_up   = self.max_goal_idx_ep[env_ids] >= promote_threshold
         goal_move_down = self.max_goal_idx_ep[env_ids] <  demote_threshold
 
+        # Curriculum mastery: track consecutive successes and gate promotion on streak >= promote_streak.
+        _promote_streak = int(getattr(self.cfg.terrain, 'promote_streak', 1))
+        if _promote_streak > 1:
+            # Success = reached promote_threshold goals. Update streak: +1 on success, reset to 0 on failure.
+            self.success_streak[env_ids] = torch.where(
+                goal_move_up,
+                self.success_streak[env_ids] + 1,
+                torch.zeros_like(self.success_streak[env_ids]))
+            # Gate promotion: must have streak >= promote_streak to move up.
+            goal_move_up = goal_move_up & (self.success_streak[env_ids] >= _promote_streak)
+
+        # Demotion mastery: track consecutive failures and gate demotion on streak >= demote_streak.
+        _demote_streak = int(getattr(self.cfg.terrain, 'demote_streak', 1))
+        if _demote_streak > 1:
+            # Failure = didn't reach demote_threshold goals. Update streak: +1 on failure, reset to 0 on success.
+            self.failure_streak[env_ids] = torch.where(
+                goal_move_down,
+                self.failure_streak[env_ids] + 1,
+                torch.zeros_like(self.failure_streak[env_ids]))
+            # Gate demotion: must have streak >= demote_streak to move down.
+            goal_move_down = goal_move_down & (self.failure_streak[env_ids] >= _demote_streak)
+
         dis_to_origin = torch.norm(
             self.root_states[env_ids, :2] - self.env_origins[env_ids, :2], dim=1)
         threshold = self.commands[env_ids, 0] * self.cfg.env.episode_length_s
@@ -2408,7 +2478,16 @@ class LeggedRobot(BaseTask):
         if max_promoted is not None:
             move_up = move_up & (self.terrain_levels[env_ids] < int(max_promoted))
 
+        # Snapshot of the rows before this call, so the column resample below fires only on a row that ACTUALLY
+        # moved. A clipped promotion at the top row or a floored demotion at min_terrain_level is not a change.
+        _old_levels = self.terrain_levels[env_ids].clone()
         self.terrain_levels[env_ids] += 1 * move_up - 1 * move_down
+
+        # Anti-forgetting: track the highest level ever reached (for random_level_frac sampling).
+        _cur_max = int(self.terrain_levels.max().item())
+        if _cur_max > self.max_level_seen:
+            self.max_level_seen = _cur_max
+
         # cfg.terrain.min_terrain_level is a hard floor on the row an env may occupy, applied ONLY to envs that actually demoted this call, never as a blanket clamp.
         # play.py's eval sweep assigns terrain_levels directly and calls this method purely to refresh derived buffers, so flooring just the demotions leaves an explicit --eval_min_level 0 pin intact while keeping the floor airtight in training.
         _min_lvl = int(getattr(self.cfg.terrain, 'min_terrain_level', 0))
@@ -2433,6 +2512,24 @@ class LeggedRobot(BaseTask):
         else:
             self.terrain_levels[env_ids] = torch.clip(
                 self.terrain_levels[env_ids], 0, self.max_terrain_level - 1)
+        # cfg.terrain.resample_type_on_level_change (False = upstream: an env keeps its column for life):
+        # whenever an env's curriculum row actually changed, deal it a fresh column. Same row means the new column
+        # carries the same nominal difficulty (difficulty is row-derived, terrain.py:500), so the promote/demote
+        # signal stays clean while the scene layout -- inter-hurdle gap and therefore wall standoff (+-0.65 m),
+        # wall tilt (+-5 deg), hurdle height jitter, ground roughness -- gets re-rolled. Two effects that matter
+        # for the depth student: the 280-row BC prefix stops rehearsing a handful of layouts, and an env stuck
+        # because ITS column happened to draw a far wall is no longer pinned there forever.
+        # Everything downstream is a [terrain_levels, terrain_types] table lookup (the lines right below and the
+        # flyball annotations), so a rewritten column propagates on its own.
+        if bool(getattr(self.cfg.terrain, 'resample_type_on_level_change', False)):
+            # num_train_cols is set with the heightfield/trimesh origins; fall back to the full column count so a
+            # plane-mesh task that flips the knob cannot AttributeError (there is no blocking to undo in that case).
+            _ntc = int(getattr(self, 'num_train_cols', None) or self.cfg.terrain.num_cols)
+            _moved = self.terrain_levels[env_ids] != _old_levels
+            _n_moved = int(_moved.sum())
+            if _n_moved > 0 and _ntc > 1:
+                self.terrain_types[env_ids[_moved]] = torch.randint(
+                    0, _ntc, (_n_moved,), device=self.device).to(torch.long)
         self.env_origins[env_ids] = self.terrain_origins[self.terrain_levels[env_ids], self.terrain_types[env_ids]]
         self.env_class[env_ids] = self.terrain_class[self.terrain_levels[env_ids], self.terrain_types[env_ids]]
         
@@ -2736,6 +2833,10 @@ class LeggedRobot(BaseTask):
         # Every slot is evaluated every step; the latch deliberately does NOT key off wococo_hurdle_idx (overloaded, and only advanced by the hurdle FSM), and the direction axis separates outbound from return crossings.
         # Consecutive steps commanded to stand still, driving the standstill_dof_error_scale ramp in _reward_dof_error.
         self.standstill_hold_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device)
+
+        # Low-velocity termination: counts consecutive steps with |vel_x| < threshold.
+        self.low_vel_steps = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device)
 
         self.hurdle_sym_prev_x = torch.zeros(
@@ -3266,7 +3367,23 @@ class LeggedRobot(BaseTask):
                 min_init_level = max(0, min(
                     int(getattr(self.cfg.terrain, 'min_terrain_level', 0)), max_init_level))
                 self.terrain_levels = torch.randint(min_init_level, max_init_level+1, (self.num_envs,), device=self.device)
-            self.terrain_types = torch.div(torch.arange(self.num_envs, device=self.device), (self.num_envs/self.cfg.terrain.num_cols), rounding_mode='floor').to(torch.long)
+            # cfg.terrain.holdout_cols carves the LAST N columns out of the pool so they can be held out of
+            # training entirely (evaluate on tiles no env ever stood on). 0 (default) = all columns in play.
+            _nc = int(self.cfg.terrain.num_cols)
+            self.num_train_cols = _nc - min(max(0, int(getattr(self.cfg.terrain, 'holdout_cols', 0))), _nc - 1)
+            # The column axis is difficulty-neutral by construction: terrain.py:500 sets difficulty from the ROW
+            # alone, and terrain.py:504's column-derived `choice` cannot change the terrain type when the mix has
+            # a single entry. So columns are dealt round-robin (env i -> col i % num_train_cols) instead of in
+            # blocked runs. Blocking matters for the depth-BC subset: it renders only envs 0..num_depth_envs-1
+            # (see _update_depth_image), and with floor division those envs all landed in the first
+            # ceil(num_depth_envs / (num_envs/num_cols)) columns for their entire life -- with 6144/80/280 that
+            # is 4 of 80 scene variants, forever, because terrain_types was never rewritten anywhere.
+            self.terrain_types = torch.remainder(torch.arange(self.num_envs, device=self.device), self.num_train_cols).to(torch.long)
+            _nd = int(getattr(self.cfg.depth, 'num_depth_envs', 0) or 0)
+            print(f"[terrain] env->column mapping: i % {self.num_train_cols} "
+                  f"(holdout {_nc - self.num_train_cols} of {_nc} cols)"
+                  + (f" | depth prefix 0..{_nd - 1} spans "
+                     f"{min(self.num_train_cols, _nd)} distinct columns" if _nd > 0 else ""))
             self.max_terrain_level = self.cfg.terrain.num_rows
             self.terrain_origins = torch.from_numpy(self.terrain.env_origins).to(self.device).to(torch.float)
             self.env_origins[:] = self.terrain_origins[self.terrain_levels, self.terrain_types]
@@ -3304,6 +3421,12 @@ class LeggedRobot(BaseTask):
             self.env_goals = torch.zeros(self.num_envs, self.cfg.terrain.num_goals + self.cfg.env.num_future_goal_obs, 3, device=self.device, requires_grad=False)
             self.cur_goal_idx = torch.zeros(self.num_envs, device=self.device, requires_grad=False, dtype=torch.long)
             self.max_goal_idx_ep = torch.zeros(self.num_envs, device=self.device, requires_grad=False, dtype=torch.long)
+            # Curriculum mastery: track consecutive successes per env for promote_streak gating.
+            self.success_streak = torch.zeros(self.num_envs, device=self.device, requires_grad=False, dtype=torch.long)
+            # Demotion mastery: track consecutive failures per env for demote_streak gating.
+            self.failure_streak = torch.zeros(self.num_envs, device=self.device, requires_grad=False, dtype=torch.long)
+            # Anti-forgetting: track the highest level ever reached (for random_level_frac sampling).
+            self.max_level_seen = 0
             temp = self.terrain_goals[self.terrain_levels, self.terrain_types]
             last_col = temp[:, -1].unsqueeze(1)
             self.env_goals[:] = torch.cat((temp, last_col.repeat(1, self.cfg.env.num_future_goal_obs, 1)), dim=1)[:]
@@ -3712,7 +3835,7 @@ class LeggedRobot(BaseTask):
         # GATED on the fleet-mean terrain level reaching yaw_post_sentinel_hold_min_mean_level, applied LAST so it wins over both gates above, and inert for non-wococo envs (latch stays -1). Yaw-only.
         if self._yaw_post_sentinel_hold_steps > 0:
             # Keep the fleet-mean-level gate as a 0-dim TENSOR and fold it into the per-env mask by broadcasting, so the comparison adds no per-step CPU/GPU sync.
-            mean_level_ok = (self.terrain_levels.float().mean()
+            mean_level_ok = (self._frontier_mean_level()
                              >= self._yaw_post_sentinel_hold_min_mean_level)
             in_hold = mean_level_ok & (self.wococo_sentinel_reached_step >= 0) & (
                 (self.episode_length_buf - self.wococo_sentinel_reached_step)
@@ -3775,6 +3898,14 @@ class LeggedRobot(BaseTask):
         rew[~self._flat_terrain_mask()] *= 0.5
         over_pit = (self.env_class == 19) & (self.root_states[:, 0] > self.env_flyball_pit_mid)
         rew[over_pit] = 0.
+        return rew
+
+    def _reward_lin_vel_y(self):
+        # Penalize lateral (sideways) velocity to encourage straight walking.
+        # Only apply on flat terrain; obstacle negotiation (wall plant, hurdle jump) legitimately needs lateral motion.
+        rew = torch.square(self.base_lin_vel[:, 1])
+        flat_mask = self._flat_terrain_mask()
+        rew = rew * flat_mask.float()
         return rew
 
     def _reward_ang_vel_xy(self):
@@ -4130,7 +4261,7 @@ class LeggedRobot(BaseTask):
         # Scale the apex above the floor linearly in fleet-mean level: 0 at mean 0, nominal at hurdle_clearance_apex_full_mean_level. x roots and y extent are untouched.
         _apex_full = getattr(self.cfg.rewards, 'hurdle_clearance_apex_full_mean_level', None)
         if _apex_full is not None:
-            _apex_scale = float((self.terrain_levels.float().mean()
+            _apex_scale = float((self._frontier_mean_level()
                                  / max(float(_apex_full), 1e-6)).clamp(0.0, 1.0))
             if _apex_scale <= 0.0:
                 return torch.zeros(self.num_envs, device=self.device)
@@ -4750,7 +4881,7 @@ class LeggedRobot(BaseTask):
                             float(start) + 2.0))
         final = float(getattr(self.cfg.rewards,
                               'wococo_stage_anneal_final_frac', 0.0))
-        mean_lvl = float(self.terrain_levels.float().mean().item())
+        mean_lvl = float(self._frontier_mean_level().item())
         if end <= float(start):
             cand = final if mean_lvl >= float(start) else 1.0
         else:

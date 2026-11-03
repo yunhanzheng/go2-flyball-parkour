@@ -95,7 +95,9 @@ class Actor(nn.Module):
                  num_priv_latent, 
                  num_priv_explicit, 
                  num_hist, activation, 
-                 tanh_encoder_output=False) -> None:
+                 tanh_encoder_output=False,
+                 use_dual_encoder=False,
+                 num_depth_latent=32) -> None:
         super().__init__()
         # prop -> scan -> priv_explicit -> priv_latent -> hist
         # actor input: prop -> scan -> priv_explicit -> latent
@@ -106,6 +108,11 @@ class Actor(nn.Module):
         self.num_priv_latent = num_priv_latent
         self.num_priv_explicit = num_priv_explicit
         self.if_scan_encode = scan_encoder_dims is not None and num_scan > 0
+        
+        # Dual-encoder mode: height scan encoder + depth latent
+        self.use_dual_encoder = use_dual_encoder
+        self.num_depth_latent = num_depth_latent
+        self.height_weight = 1.0  # Adaptive weight for height latent (1.0 -> 0.0)
 
         if len(priv_encoder_dims) > 0:
                     priv_encoder_layers = []
@@ -140,11 +147,12 @@ class Actor(nn.Module):
             self.scan_encoder_output_dim = num_scan
         
         actor_layers = []
-        actor_layers.append(nn.Linear(num_prop+
-                                      self.scan_encoder_output_dim+
-                                      num_priv_explicit+
-                                      priv_encoder_output_dim, 
-                                      actor_hidden_dims[0]))
+        # Dual-encoder mode: input includes both height and depth latents
+        if self.use_dual_encoder:
+            input_dim = num_prop + self.scan_encoder_output_dim + self.num_depth_latent + num_priv_explicit + priv_encoder_output_dim
+        else:
+            input_dim = num_prop + self.scan_encoder_output_dim + num_priv_explicit + priv_encoder_output_dim
+        actor_layers.append(nn.Linear(input_dim, actor_hidden_dims[0]))
         actor_layers.append(activation)
         for l in range(len(actor_hidden_dims)):
             if l == len(actor_hidden_dims) - 1:
@@ -156,7 +164,7 @@ class Actor(nn.Module):
             actor_layers.append(nn.Tanh())
         self.actor_backbone = nn.Sequential(*actor_layers)
 
-    def forward(self, obs, hist_encoding: bool, eval=False, scandots_latent=None):
+    def forward(self, obs, hist_encoding: bool, eval=False, scandots_latent=None, depth_latent=None):
         if not eval:
             if self.if_scan_encode:
                 obs_scan = obs[:, self.num_prop:self.num_prop + self.num_scan]
@@ -164,7 +172,14 @@ class Actor(nn.Module):
                     scan_latent = self.scan_encoder(obs_scan)   
                 else:
                     scan_latent = scandots_latent
-                obs_prop_scan = torch.cat([obs[:, :self.num_prop], scan_latent], dim=1)
+                
+                # Dual-encoder mode: concatenate height and depth latents
+                if self.use_dual_encoder and depth_latent is not None:
+                    # Apply adaptive height weight
+                    scan_latent_weighted = self.height_weight * scan_latent
+                    obs_prop_scan = torch.cat([obs[:, :self.num_prop], scan_latent_weighted, depth_latent], dim=1)
+                else:
+                    obs_prop_scan = torch.cat([obs[:, :self.num_prop], scan_latent], dim=1)
             else:
                 obs_prop_scan = obs[:, :self.num_prop + self.num_scan]
             obs_priv_explicit = obs[:, self.num_prop + self.num_scan:self.num_prop + self.num_scan + self.num_priv_explicit]
@@ -182,7 +197,14 @@ class Actor(nn.Module):
                     scan_latent = self.scan_encoder(obs_scan)   
                 else:
                     scan_latent = scandots_latent
-                obs_prop_scan = torch.cat([obs[:, :self.num_prop], scan_latent], dim=1)
+                
+                # Dual-encoder mode: concatenate height and depth latents
+                if self.use_dual_encoder and depth_latent is not None:
+                    # Apply adaptive height weight
+                    scan_latent_weighted = self.height_weight * scan_latent
+                    obs_prop_scan = torch.cat([obs[:, :self.num_prop], scan_latent_weighted, depth_latent], dim=1)
+                else:
+                    obs_prop_scan = torch.cat([obs[:, :self.num_prop], scan_latent], dim=1)
             else:
                 obs_prop_scan = obs[:, :self.num_prop + self.num_scan]
             obs_priv_explicit = obs[:, self.num_prop + self.num_scan:self.num_prop + self.num_scan + self.num_priv_explicit]
@@ -221,6 +243,8 @@ class ActorCriticRMA(nn.Module):
                         activation='elu',
                         init_noise_std=1.0,
                         max_noise_std=None,
+                        use_dual_encoder=False,
+                        num_depth_latent=32,
                         **kwargs):
         if kwargs:
             print("ActorCritic.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()]))
@@ -230,7 +254,7 @@ class ActorCriticRMA(nn.Module):
         priv_encoder_dims= kwargs['priv_encoder_dims']
         activation = get_activation(activation)
         
-        self.actor = Actor(num_prop, num_scan, num_actions, scan_encoder_dims, actor_hidden_dims, priv_encoder_dims, num_priv_latent, num_priv_explicit, num_hist, activation, tanh_encoder_output=kwargs['tanh_encoder_output'])
+        self.actor = Actor(num_prop, num_scan, num_actions, scan_encoder_dims, actor_hidden_dims, priv_encoder_dims, num_priv_latent, num_priv_explicit, num_hist, activation, tanh_encoder_output=kwargs['tanh_encoder_output'], use_dual_encoder=use_dual_encoder, num_depth_latent=num_depth_latent)
         
 
         # Value function
@@ -283,29 +307,29 @@ class ActorCriticRMA(nn.Module):
     def entropy(self):
         return self.distribution.entropy().sum(dim=-1)
 
-    def update_distribution(self, observations, hist_encoding, scandots_latent=None):
+    def update_distribution(self, observations, hist_encoding, scandots_latent=None, depth_latent=None):
         # `scandots_latent` overrides the scan-encoder output, which is what lets the
         # SAME actor be driven by the depth encoder's latent instead of the height scan
         # (single-stage depth PPO). None keeps the privileged scan path untouched.
-        mean = self.actor(observations, hist_encoding, scandots_latent=scandots_latent)
+        mean = self.actor(observations, hist_encoding, scandots_latent=scandots_latent, depth_latent=depth_latent)
         if self.max_noise_std is not None:
             with torch.no_grad():
                 self.std.data.clamp_(max=self.max_noise_std)
         self.distribution = Normal(mean, mean*0. + self.std)
 
-    def act(self, observations, hist_encoding=False, scandots_latent=None, **kwargs):
-        self.update_distribution(observations, hist_encoding, scandots_latent)
+    def act(self, observations, hist_encoding=False, scandots_latent=None, depth_latent=None, **kwargs):
+        self.update_distribution(observations, hist_encoding, scandots_latent, depth_latent)
         return self.distribution.sample()
     
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
-    def act_inference(self, observations, hist_encoding=False, eval=False, scandots_latent=None, **kwargs):
+    def act_inference(self, observations, hist_encoding=False, eval=False, scandots_latent=None, depth_latent=None, **kwargs):
         if not eval:
-            actions_mean = self.actor(observations, hist_encoding, eval, scandots_latent)
+            actions_mean = self.actor(observations, hist_encoding, eval, scandots_latent, depth_latent)
             return actions_mean
         else:
-            actions_mean, latent_hist, latent_priv = self.actor(observations, hist_encoding, eval=True)
+            actions_mean, latent_hist, latent_priv = self.actor(observations, hist_encoding, eval=True, scandots_latent=scandots_latent, depth_latent=depth_latent)
             return actions_mean, latent_hist, latent_priv
 
     def evaluate(self, critic_observations, **kwargs):

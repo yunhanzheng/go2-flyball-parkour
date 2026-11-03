@@ -121,8 +121,8 @@ def main():
     if not getattr(env_cfg.depth, "render_on_demand", False):
         sys.exit("[joint] needs --render_on_demand; the eager path ray-casts the whole fleet "
                  "on every capture step, so a prefix subset would save no ray")
-    if not 0 < nd < env_cfg.env.num_envs:
-        sys.exit(f"[joint] --num_depth_envs must be in (0, num_envs={env_cfg.env.num_envs}); "
+    if not 0 < nd <= env_cfg.env.num_envs:
+        sys.exit(f"[joint] --num_depth_envs must be in (0, num_envs={env_cfg.env.num_envs}]; "
                  f"got {nd}. Set it to the number of envs that should actually render depth.")
 
     for attr, dst in [("minibatches", "num_mini_batches"), ("epochs", "num_learning_epochs"),
@@ -184,11 +184,11 @@ def main():
 
     start_it = 0
     if ex.resume_ckpt:
-        runner.load(ex.resume_ckpt, load_optimizer=True)
+        runner.load(ex.resume_ckpt, load_optimizer=False)
         import re
         m = re.search(r"model_(\d+)\.pt", ex.resume_ckpt)
-        start_it = int(m.group(1)) + 1 if m else 0
-        print(f"[joint] resumed {ex.resume_ckpt} -> start iter {start_it}", flush=True)
+        start_it = 0  # always start counter from 0 regardless of checkpoint name
+        print(f"[joint] resumed {ex.resume_ckpt} (weights only, fresh optimizer) -> start iter {start_it}", flush=True)
     if ex.init_std is not None:
         with torch.no_grad():
             old = ac.std.mean().item()
@@ -237,6 +237,16 @@ def main():
     critic_obs = privileged_obs.to(dev) if privileged_obs is not None else obs
 
     tot = args.max_iterations if args.max_iterations is not None else train_cfg.runner.max_iterations
+    # Terrain-coverage telemetry. This run enables cfg.terrain.resample_type_on_level_change, which re-deals the
+    # terrain COLUMN whenever an env's curriculum row actually moves. Without a counter there is no way to tell a
+    # run that is genuinely walking the column pool apart from one that quietly stayed pinned to the same handful
+    # of layouts, because nothing else in the logs depends on terrain_types. "Lifetime" accumulates every distinct
+    # (row, col) seen so far: the prefix number bounds what the depth encoder can learn to generalise over, and
+    # the fleet number is the teacher's scan coverage, i.e. the ceiling the prefix is chasing. holdout_hits is an
+    # invariant and must stay 0 (columns >= num_train_cols are never dealt in training).
+    seen_cols, seen_tiles, seen_tiles_fleet = set(), set(), set()
+    _ntc = int(getattr(env, "num_train_cols", env_cfg.terrain.num_cols))
+
     for it in range(start_it, tot):
         t0 = time.time()
         snaps = []
@@ -274,15 +284,54 @@ def main():
         lvl = env.terrain_levels.float()
         nrow = env_cfg.terrain.num_rows
         mean_lvl = lvl.mean().item()
+        # Frontier mean: only envs at the highest occupied level. Excludes the
+        # random_level_frac envs that get uniformly scattered across [0, max],
+        # so this is a cleaner signal of actual curriculum progress.
+        _max_lvl = int(lvl.max().item())
+        _frontier_mask = (env.terrain_levels == _max_lvl)
+        _frontier_n = int(_frontier_mask.sum().item())
+        frontier_mean_lvl = float(lvl[_frontier_mask].mean().item()) if _frontier_n > 0 else 0.0
+        # Frontier-80 mean: top 80% of envs by level (excludes bottom 20% random-level envs).
+        # This matches what _frontier_mean_level() uses internally for decision-making.
+        _random_frac = float(getattr(env_cfg.terrain, 'random_level_frac', 0.0))
+        if _random_frac > 0.0:
+            _sorted = lvl.sort(descending=True).values
+            _n80 = max(int((1.0 - _random_frac) * len(_sorted)), 1)
+            frontier80_mean_lvl = float(_sorted[:_n80].mean().item())
+        else:
+            frontier80_mean_lvl = mean_lvl
+        terr = {}
+        if it % 10 == 0:
+            # Sampled, not every iter: two .cpu() round trips per iter would be pure sync cost, and the
+            # lifetime counts it feeds are cumulative statistics that a 10-iter stride cannot distort.
+            _tc = env.terrain_types[:NBC].cpu().tolist()
+            _tl = env.terrain_levels[:NBC].cpu().tolist()
+            _ac = env.terrain_types.cpu().tolist()
+            _al = env.terrain_levels.cpu().tolist()
+            seen_cols.update(_tc)
+            seen_tiles.update(zip(_tl, _tc))
+            seen_tiles_fleet.update(zip(_al, _ac))
+            terr = {
+                'terrain/prefix_distinct_cols_now': float(len(set(_tc))),
+                'terrain/prefix_distinct_tiles_now': float(len(set(zip(_tl, _tc)))),
+                'terrain/prefix_cols_lifetime': float(len(seen_cols)),
+                'terrain/prefix_tiles_lifetime': float(len(seen_tiles)),
+                'terrain/fleet_tiles_lifetime': float(len(seen_tiles_fleet)),
+                'terrain/holdout_hits': float(sum(1 for c in _ac if c >= _ntc)),
+            }
         print(f"[joint] iter {it:4d} | act_err={act_err:.4f} lat_err={lat_err:.4f} | value={mv:.4f} "
               f"surr={ms:.4f} est={me:.4f} ev={getattr(alg, 'last_explained_var', float('nan')):.3f} "
               f"kl={getattr(alg, 'last_kl_mean', float('nan')):.4f} lr={alg.learning_rate:.2e} "
-              f"LVL mean={mean_lvl:.2f} max={int(lvl.max().item())} "
+              f"LVL mean={mean_lvl:.2f} front={frontier_mean_lvl:.1f}(n={_frontier_n}) f80={frontier80_mean_lvl:.2f} max={_max_lvl} "
               f"top%={100.0 * (lvl >= nrow - 1).float().mean().item():.0f} "
+              f"| prefix tiles={len(seen_tiles)}/{NBC}envs cols={len(seen_cols)}/{_ntc} "
               f"| t={time.time() - t0:.1f}s [roll={t_roll:.2f} bc={t_bc:.2f} upd={t_upd:.2f}]",
               flush=True)
         for k, v in [('curriculum/mean_level', mean_lvl),
-                     ('curriculum/max_level', float(lvl.max().item())),
+                     ('curriculum/frontier_mean_level', frontier_mean_lvl),
+                     ('curriculum/frontier80_mean_level', frontier80_mean_lvl),
+                     ('curriculum/frontier_count', float(_frontier_n)),
+                     ('curriculum/max_level', float(_max_lvl)),
                      ('curriculum/frac_top_row', (lvl >= nrow - 1).float().mean().item()),
                      ('curriculum/frac_row_ge_7', (lvl >= 7).float().mean().item()),
                      ('bc/act_err', act_err), ('bc/lat_err', lat_err),
@@ -298,6 +347,8 @@ def main():
                      ('ppo/lr_floor_frac', getattr(alg, 'last_lr_floor_frac', float('nan'))),
                      ('policy/action_std', ac.std.mean().item()),
                      ('ppo/lr', alg.learning_rate), ('perf/iter_time', time.time() - t0)]:
+            writer.add_scalar(k, v, it)
+        for k, v in terr.items():
             writer.add_scalar(k, v, it)
         ep = infos.get('episode') if isinstance(infos, dict) else None
         if ep:

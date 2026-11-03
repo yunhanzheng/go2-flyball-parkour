@@ -65,6 +65,15 @@ class Go2TeacherCfg( Go2RoughCfg ):
         next_goal_threshold       = 0.2
         terminate_on_lateral_deviation = True
         lateral_deviation_term_m       = 1.5
+        terminate_on_yaw_tracking = False  # TEMP: disabled for video diagnosis
+        # Low-velocity termination: stop episode if robot stalls in front of obstacle.
+        terminate_on_low_velocity = True
+        low_velocity_term_mps = 0.1  # m/s threshold
+        low_velocity_term_duration_steps = 50  # 2s @ 25Hz control frequency
+        # Start pose randomization: fixed range (no terrain-level scaling)
+        randomize_start_pos = True   # ±0.3m xy jitter
+        randomize_start_yaw = True   # fixed yaw range
+        rand_yaw_range = 0.3         # max ±17° at all levels
 
     class commands( Go2RoughCfg.commands ):
         # Per episode: STANDSTILL (random 0-4 s) -> RUN -> HARD STOP.
@@ -113,30 +122,38 @@ class Go2TeacherCfg( Go2RoughCfg ):
         randomize_motor            = True
         motor_strength_range       = [0.8, 1.2]
 
-        # Fixed-delay model: no per-env action/proprio latency DR.
-        randomize_action_latency   = False
+        # Per-env random action latency: each episode samples U[0,2] steps (0-40ms).
+        # Deploy-faithful: the real Go2 has ~20ms comms lag, so training with random
+        # latency teaches the policy to handle variable delay robustly.
+        randomize_action_latency   = True
+        action_latency_range       = [0, 2]        # 0, 20, or 40ms per env per episode
         randomize_proprio_latency  = False
-        action_delay               = True
-        action_delay_latch_mean_level = 6.0
+        action_delay               = False         # superseded by randomize_action_latency
+        action_delay_latch_mean_level = None
         action_delay_latch_step       = None
         action_delay_ramp_steps       = 0
         randomize_contact_threshold = False
 
-        # Every reset samples a per-env dr_scale below the ceiling set by
-        # dr_ramp_full_at_mean_level (see the note on that field below).
-        dr_scale_range             = [0.0, 1.0]
-        dr_lock_to_terrain_level   = True
+        # Full DR from step 0, no curriculum ramp. dr_lock_to_terrain_level=False
+        # means every env always runs at dr_scale=1.0 regardless of terrain level.
+        # Action latency is independently random per episode (randomize_action_latency),
+        # so coupling it to terrain level would be double-dipping.
+        dr_scale_range             = [1.0, 1.0]
+        dr_lock_to_terrain_level   = False
         dr_ramp_use_mean_level     = True
-        dr_scale_sample_per_env    = True
-        # Back to 6.0 after the new-run-v3 trial at 9.0. Deferring DR did help on
-        # its own terms -- 8-row full-DR reach 0.238 -> 0.381, and the climb to row 7
-        # went from 1800 to 300 iters -- but the curriculum still parked at mean level
-        # 7.0, because the real blocker is the promote/demote band (3/8 up, <2/8 down
-        # bounces every env between rows 7 and 8). Reverted so the next run changes
-        # only the curriculum gate; REAL runs a fixed full-range DR with no ramp at all.
-        dr_ramp_full_at_mean_level = 6.0
-        dr_ramp_arm_below_mean_level = 0.5
+        dr_scale_sample_per_env    = False
+        dr_ramp_full_at_mean_level = None      # disabled — no ramp
+        dr_ramp_arm_below_mean_level = 0.0     # inert when dr_lock_to_terrain_level=False
         dr_ramp_start_armed        = False
+
+    class depth(Go2RoughCfg.depth):
+        # Keep the training terrain mix (100% flywall_box) during camera replay.
+        # The default True rewrites to a multi-terrain mix for student distillation,
+        # but for evaluation we want the same terrain the teacher trained on.
+        override_terrain_mix_for_camera = False
+        # Also keep the same terrain grid (horizontal_scale, num_cols) so the
+        # wall position matches the height-scan replay exactly.
+        override_terrain_grid_for_camera = False
 
     class noise(Go2RoughCfg.noise):
         # The DR ramp above scales these proprio/height noise samples by dr_scale;
@@ -165,6 +182,29 @@ class Go2TeacherCfg( Go2RoughCfg ):
         curriculum  = True
         no_demotion = False   # the demote band below needs demotion on
         num_cols    = 80
+        # Re-deal the terrain COLUMN to an env every time its curriculum row actually moves.
+        # Columns are difficulty-neutral here: terrain.py:500 derives difficulty from the row only, and with a
+        # single-entry mix the column-dependent `choice` (terrain.py:504) cannot switch terrain type either.
+        # What a column DOES carry is the layout re-roll -- inter-hurdle gap uniform(1.5,2.8) m, which also shifts
+        # the wall standoff by the same +-0.65 m -- wall tilt +-5 deg, hurdle height jitter, ground roughness.
+        # Paired with the round-robin i % num_cols initial mapping (legged_gym/envs/base/legged_robot.py), this
+        # lifts the depth-BC subset (cfg.depth.num_depth_envs rows, always envs 0..nd-1 because the partial-fleet
+        # capture masks the rest) off its 4 fixed layouts: blocked columns + no resample meant envs 0..279 saw
+        # cols 0..3 for their entire lives, while the teacher's scan covers all 80.
+        # Requires the column resample in _update_terrain_curriculum; off (absent) = upstream per-life pinning.
+        resample_type_on_level_change = True
+
+        # Curriculum mastery: require N consecutive successes before promoting (prevents one-lucky-episode promotion).
+        # success = max_goal_idx_ep >= promote_threshold (70% of goals). Failure resets streak to 0.
+        promote_streak = 1
+
+        # Demotion mastery: require N consecutive failures before demoting (prevents one-bad-episode demotion).
+        # failure = max_goal_idx_ep < demote_threshold (30% of goals). Success resets streak to 0.
+        demote_streak = 1
+
+        # Anti-forgetting: fraction of envs that randomly sample level in [0, max_level_seen] at each reset.
+        # Keeps 80% on the curriculum frontier, 20% exploring the full range to prevent catastrophic forgetting.
+        random_level_frac = 0.2
 
         horizontal_scale        = 0.01   # 1 cm cells represent the thickness curriculum
         terrain_length          = 10.0
@@ -189,6 +229,9 @@ class Go2TeacherCfg( Go2RoughCfg ):
         # lerp cannot reintroduce sub-minimum bars.
         flyball_hurdle_height_decorrelate   = True
         flyball_hurdle_zero_prob            = 0.25
+        # Hurdle count distribution (Row 4-9): 25% zero / 25% single / 50% double.
+        # zero_prob=0.25 → 25% tiles have 0 hurdles. Among remaining 75%: single_prob=0.333 → 25% have 1 hurdle, 50% have 2.
+        flyball_single_hurdle_prob          = 0.333
         flyball_hurdle_height_jitter_m      = 0.0
         flyball_single_hurdle_thickness      = 0.01
         flyball_single_hurdle_thickness_range = None
@@ -201,7 +244,8 @@ class Go2TeacherCfg( Go2RoughCfg ):
         flyball_hurdle_clear_half_span         = 0.10
         flyball_hurdle_clear_box_height        = 0.17
         flyball_hurdle_roughness_height       = (0.0, 0.01)
-        flyball_hurdle_jitter_scale_with_difficulty = True
+        # Distance jitter scales with difficulty: False = all rows get full [1.30, 1.90] m range (prevents memorizing 1.60 m at row 0).
+        flyball_hurdle_jitter_scale_with_difficulty = False
 
         flyball_spawn_x                       = 1.0
         flyball_hurdle_front_from_spawn       = 1.60
@@ -251,7 +295,7 @@ class Go2TeacherCfg( Go2RoughCfg ):
         flyball_wall_goal_idx   = 1
         flyball_return_goal_idx = 2
 
-        max_init_terrain_level = 5
+        max_init_terrain_level = 0   # E09: all envs start at level 0, curriculum climbs from there
         resample_at_max_level  = True
         resample_min_level     = 4
         # [swimmer] Goal curriculum re-anchored to the 4-waypoint circuit. max_goal_idx
@@ -471,6 +515,7 @@ class Go2TeacherCfg( Go2RoughCfg ):
 
             tracking_goal_vel = 1.5   # combined tracking budget 2.0
             tracking_yaw      = 0.5
+            lin_vel_y         = -1.0  # penalize lateral drift to walk straighter
             standstill_orientation = 0.5
             feet_contact_forces = -0.01
 
@@ -508,3 +553,14 @@ class Go2TeacherCfgPPO( Go2RoughCfgPPO ):
     class policy( Go2RoughCfgPPO.policy ):
         init_noise_std = 1.0
         max_noise_std  = 1.0
+    
+    # Dual-encoder consistency loss configuration
+    use_dual_encoder = True  # Enable dual-encoder mode (height + depth)
+    consistency_loss_weight = 0.1  # Weight for latent consistency loss
+    num_depth_latent = 32  # Dimension of depth latent
+    
+    # Adaptive height weight decay triggers
+    height_decay_trigger_success_rate = 0.5  # Min success rate to start decay
+    height_decay_trigger_mean_level = 2  # Min terrain level to start decay
+    height_decay_trigger_consistency = 0.1  # Max latent consistency to start decay
+    height_decay_rate = 0.995  # Decay rate per trigger (0.995 = 0.5% per decay)
