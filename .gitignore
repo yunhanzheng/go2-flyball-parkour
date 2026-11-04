@@ -22,6 +22,11 @@ legged_gym/logs/extreme-parkour/*
 !legged_gym/logs/extreme-parkour/flat_baseline/
 wandb/
 
+# Temporary / scratch
+.tmp-neural-map/
+legged_gym/nohup.out
+videos/
+
 # Generated at runtime
 legged_gym/legged_gym/scripts/terrain_mesh.npz
 # play.py --show_cam: URDF copy with the D435i housing, regenerated each run
