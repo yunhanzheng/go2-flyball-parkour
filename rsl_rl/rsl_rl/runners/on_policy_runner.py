@@ -81,6 +81,9 @@ class OnPolicyRunner:
         estimator = Estimator(input_dim=env.cfg.env.n_proprio, output_dim=env.cfg.env.n_priv, hidden_dims=self.estimator_cfg["hidden_dims"]).to(self.device)
         # Depth encoder
         self.if_depth = self.depth_encoder_cfg["if_depth"]
+        self.use_dual_encoder = bool(self.alg_cfg.get("use_dual_encoder", False))
+        if self.use_dual_encoder and not self.if_depth:
+            raise ValueError("[runner] dual-encoder PPO requires --use_camera")
         # Yaw predictor toggle (EP_USE_YAW=1): the depth encoder regresses a
         # 2-D heading that is fed into the student's obs[:,6:8] and supervised
         # against the teacher's commanded heading. Off => zeroed heading slots.
@@ -90,6 +93,8 @@ class OnPolicyRunner:
         # (see PPO.train_depth_ppo / learn_depth_ppo).
         self.train_depth_ppo = bool(
             self.if_depth and self.depth_encoder_cfg.get("train_with_ppo", False))
+        if self.train_depth_ppo and self.use_dual_encoder:
+            raise ValueError("[runner] depth PPO and dual-encoder PPO are mutually exclusive")
         if self.train_depth_ppo and self.use_yaw:
             raise ValueError(
                 "[runner] depth PPO cannot run with EP_USE_YAW=1: the encoder head then "
@@ -100,7 +105,8 @@ class OnPolicyRunner:
                                                     self.depth_encoder_cfg["hidden_dims"],
                                                     )
             depth_encoder = RecurrentDepthBackbone(depth_backbone, env.cfg).to(self.device)
-            depth_actor = None if self.train_depth_ppo else deepcopy(actor_critic.actor)
+            depth_actor = (None if self.train_depth_ppo or self.use_dual_encoder
+                           else deepcopy(actor_critic.actor))
         else:
             depth_encoder = None
             depth_actor = None
@@ -114,6 +120,11 @@ class OnPolicyRunner:
                                   estimator, self.estimator_cfg, 
                                   depth_encoder, self.depth_encoder_cfg, depth_actor,
                                   device=self.device, **self.alg_cfg)
+        actor_dual = bool(getattr(self.alg.actor_critic.actor, 'use_dual_encoder', False))
+        if actor_dual != self.use_dual_encoder:
+            raise RuntimeError(
+                f"[runner] dual-encoder config mismatch: algorithm={self.use_dual_encoder}, "
+                f"actor={actor_dual}. Set policy.use_dual_encoder to match algorithm.")
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
         self.dagger_update_freq = self.alg_cfg["dagger_update_freq"]
@@ -847,6 +858,9 @@ class OnPolicyRunner:
             }
         if self.if_depth:
             state_dict['depth_encoder_state_dict'] = self.alg.depth_encoder.state_dict()
+            if self.use_dual_encoder:
+                state_dict['dual_encoder_height_weight'] = float(
+                    self.alg.actor_critic.actor.height_weight)
             # Depth PPO has no separate depth actor (the trained actor IS the depth actor).
             if getattr(self.alg, 'depth_actor', None) is not None:
                 state_dict['depth_actor_state_dict'] = self.alg.depth_actor.state_dict()
@@ -857,6 +871,9 @@ class OnPolicyRunner:
         print("Loading model from {}...".format(path))
         loaded_dict = torch.load(path, map_location=self.device)
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
+        if self.use_dual_encoder and 'dual_encoder_height_weight' in loaded_dict:
+            self.alg.actor_critic.actor.height_weight = float(
+                loaded_dict['dual_encoder_height_weight'])
         self.alg.estimator.load_state_dict(loaded_dict['estimator_state_dict'])
         if self.if_depth:
             if 'depth_encoder_state_dict' not in loaded_dict:
@@ -886,6 +903,16 @@ class OnPolicyRunner:
         return loaded_dict['infos']
 
     def get_inference_policy(self, device=None):
+        # A depth actor exists for DAgger, but dual-encoder PPO also inherits that
+        # clone even though training updates actor_critic.actor. Select by training
+        # mode rather than by the mere presence of the module.
+        use_depth_actor = (
+            self.if_depth and not self.train_depth_ppo
+            and not getattr(self.alg, 'use_dual_encoder', False))
+        if use_depth_actor:
+            print("[runner] inference actor: depth_actor (DAgger)")
+            return self.get_depth_actor_inference_policy(device=device)
+        print("[runner] inference actor: actor_critic.actor (PPO)")
         self.alg.actor_critic.eval() # switch to evaluation mode (dropout for example)
         if device is not None:
             self.alg.actor_critic.to(device)

@@ -115,6 +115,14 @@ class Go2StudentCfg(Go2TeacherCfg):
 
 
 class Go2StudentCfgPPO(Go2TeacherCfgPPO):
+    # DAgger and single-stage depth PPO replace the scan latent; they do not use
+    # the teacher's height+depth fusion actor or its dual-encoder PPO rollout.
+    class policy(Go2TeacherCfgPPO.policy):
+        use_dual_encoder = False
+
+    class algorithm(Go2TeacherCfgPPO.algorithm):
+        use_dual_encoder = False
+
     class runner(Go2TeacherCfgPPO.runner):
         save_interval = 1000
 

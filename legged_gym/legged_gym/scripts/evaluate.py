@@ -145,23 +145,28 @@ def play(args):
 
     for i in tqdm(range(1500)):
 
+        obs_actor = obs.detach()
+        dual_encoder = getattr(ppo_runner.alg, "use_dual_encoder", False)
         if env.cfg.depth.use_camera:
             if infos["depth"] is not None:
-                obs_student = obs[:, :env.cfg.env.n_proprio]
-                obs_student[:, 6:8] = 0
+                obs_prop_depth = obs_actor[:, :env.cfg.env.n_proprio].clone()
+                obs_prop_depth[:, 6:8] = 0
                 with torch.no_grad():
-                    depth_latent = depth_encoder(infos["depth"], obs_student)
-            # Yaw predictor removed: zero the heading slots (depth-only).
-            obs[:, 6:8] = 0
+                    depth_latent = depth_encoder(infos["depth"], obs_prop_depth)
+            if not dual_encoder:
+                # Yaw predictor removed: zero the heading slots (depth-only).
+                obs_actor = obs_actor.clone()
+                obs_actor[:, 6:8] = 0
 
         else:
             depth_latent = None
 
-        if hasattr(ppo_runner.alg, "depth_actor"):
-            with torch.no_grad():
-                actions = ppo_runner.alg.depth_actor(obs.detach(), hist_encoding=True, scandots_latent=depth_latent)
+        if dual_encoder:
+            actions = policy(obs_actor, hist_encoding=True,
+                             scandots_latent=None, depth_latent=depth_latent)
         else:
-            actions = policy(obs.detach(), hist_encoding=True, scandots_latent=depth_latent)
+            actions = policy(obs_actor, hist_encoding=True,
+                             scandots_latent=depth_latent)
             
         cur_goal_idx = env.cur_goal_idx.clone()
         obs, _, rews, dones, infos = env.step(actions.detach())

@@ -18,6 +18,7 @@ import os
 import sys
 import types
 
+import pytest
 import torch
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -28,6 +29,7 @@ from rsl_rl.modules import (                                    # noqa: E402
     ActorCriticRMA, Estimator, RecurrentDepthBackbone,
     DepthOnlyFCBackbone58x87)
 from rsl_rl.algorithms import PPO                               # noqa: E402
+from rsl_rl.runners.on_policy_runner import OnPolicyRunner      # noqa: E402
 
 N_PROP, N_SCAN, N_HIST, N_PRIV_LAT, N_PRIV, N_ACT = 53, 132, 10, 29, 9, 12
 N_OBS = N_PROP + N_SCAN + N_HIST * N_PROP + N_PRIV_LAT + N_PRIV
@@ -35,12 +37,13 @@ N_ENV, T, TICK = 8, 6, 3
 TORCH_SEED = 0
 
 
-def _actor_critic():
+def _actor_critic(use_dual_encoder=False):
     return ActorCriticRMA(
         N_PROP, N_SCAN, N_OBS, N_PRIV_LAT, N_PRIV, N_HIST, N_ACT,
         scan_encoder_dims=[128, 64, 32], actor_hidden_dims=[256, 128],
         critic_hidden_dims=[256, 128], activation='elu', init_noise_std=1.0,
-        priv_encoder_dims=[64, 20], tanh_encoder_output=False)
+        priv_encoder_dims=[64, 20], tanh_encoder_output=False,
+        use_dual_encoder=use_dual_encoder, num_depth_latent=32)
 
 
 def _estimator():
@@ -64,7 +67,7 @@ def _rollout(ppo, enc, with_depth):
     """Mimic learn_depth_ppo: encoder ticks every TICK steps, latent held in between."""
     ppo.init_storage(N_ENV, T, [N_OBS], [None], [N_ACT])
     obs = torch.randn(N_ENV, N_OBS)
-    latent = frame = hidden = None
+    latent = frame = hidden = prop = None
     for t in range(T):
         if with_depth and t % TICK == 0:
             if enc.hidden_states is None:
@@ -77,7 +80,7 @@ def _rollout(ppo, enc, with_depth):
                 latent = enc(frame.clone(), prop)
         with torch.inference_mode():
             ppo.act(obs, obs, {}, hist_encoding=True, depth_latent=latent,
-                    depth_img=frame, depth_hidden=hidden)
+                    depth_img=frame, depth_hidden=hidden, depth_prop=prop)
             ppo.process_env_step(torch.randn(N_ENV), torch.zeros(N_ENV), {})
         obs = torch.randn(N_ENV, N_OBS)
     return obs
@@ -134,6 +137,63 @@ def test_no_camera_path_unchanged():
     ppo.compute_returns(obs)
     ppo.update()
     ppo.update_dagger()
+
+
+def test_dual_encoder_ppo_plumbing():
+    torch.manual_seed(TORCH_SEED)
+    ac = _actor_critic(use_dual_encoder=True)
+    assert ac.actor.actor_backbone[0].weight.shape[1] == 146
+    obs = torch.randn(2, N_OBS)
+    with pytest.raises(ValueError, match='requires depth_latent'):
+        ac.act_inference(obs, hist_encoding=True)
+    actions_zero = ac.act_inference(
+        obs, hist_encoding=True, depth_latent=torch.zeros(2, 32))
+    actions_one = ac.act_inference(
+        obs, hist_encoding=True, depth_latent=torch.ones(2, 32))
+    assert not torch.allclose(actions_zero, actions_one)
+
+    backbone, stub = _backbone()
+    enc = RecurrentDepthBackbone(backbone, stub)
+    ppo = PPO(ac, _estimator(), _ESTIMATOR_PARAS, enc,
+              dict(_DEPTH_PARAS, train_with_ppo=False), None,
+              num_learning_epochs=2, num_mini_batches=2, learning_rate=3e-4,
+              schedule='fixed', desired_kl=0.01, max_grad_norm=1.0, device='cpu',
+              priv_reg_coef_schedual=[0, 0.1, 5000, 3000],
+              use_dual_encoder=True, consistency_loss_weight=0.1)
+    assert not hasattr(ppo, 'depth_actor')
+    assert len(ppo.optimizer.param_groups) == 2
+    assert ppo.depth_encoder_optimizer is ppo.optimizer
+
+    conv_w0 = backbone.image_compression[0].weight.detach().clone()
+    obs = _rollout(ppo, enc, with_depth=True)
+    ppo.compute_returns(obs)
+    ppo.update()
+    moved = (backbone.image_compression[0].weight.detach() - conv_w0).abs().max()
+    assert moved.item() > 0.0, "dual PPO did not update the depth encoder"
+    hist_loss = ppo.update_dagger()
+    assert hist_loss >= 0.0
+
+
+def test_inference_actor_matches_training_path():
+    for if_depth, train_depth_ppo, dual_encoder, expected in [
+            (False, False, False, 'main'),
+            (True, True, False, 'main'),
+            (True, False, True, 'main'),
+            (True, False, False, 'depth')]:
+        runner = object.__new__(OnPolicyRunner)
+        runner.if_depth = if_depth
+        runner.train_depth_ppo = train_depth_ppo
+        runner.alg = types.SimpleNamespace(
+            use_dual_encoder=dual_encoder,
+            actor_critic=types.SimpleNamespace(
+                act_inference='main', eval=lambda: None, to=lambda device: None),
+            depth_actor=types.SimpleNamespace(
+                eval=lambda: None, to=lambda device: None))
+        policy = runner.get_inference_policy(device='cpu')
+        if expected == 'main':
+            assert policy == 'main'
+        else:
+            assert policy is runner.alg.depth_actor
 
 
 def test_dagger_path_keeps_depth_actor():

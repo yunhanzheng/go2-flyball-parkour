@@ -196,11 +196,10 @@ class PPO:
             self.depth_encoder = depth_encoder
             self.depth_encoder_optimizer = optim.Adam(self.depth_encoder.parameters(), lr=depth_encoder_paras["learning_rate"])
             self.depth_encoder_paras = depth_encoder_paras
-            if self.train_depth_ppo:
-                # The encoder joins the PPO optimizer as a SECOND parameter group with
-                # its own base lr. There is no separate depth actor: actor_critic.actor
-                # IS the depth actor (driven through scandots_latent), so nothing is
-                # cloned and nothing is distilled.
+            if self.train_depth_ppo or use_dual_encoder:
+                # Both single-stage depth PPO and dual-encoder PPO backpropagate
+                # through the camera latent. The encoder must therefore share the
+                # optimizer that is actually stepped in update(), with its own lr.
                 self.depth_encoder_lr_ratio = float(depth_encoder_paras["learning_rate"]) / float(learning_rate)
                 self.optimizer = optim.Adam([
                     {'params': list(self.actor_critic.parameters()), 'lr': learning_rate},
@@ -208,7 +207,8 @@ class PPO:
                      'lr': float(depth_encoder_paras["learning_rate"])},
                 ], lr=learning_rate)
                 self.depth_encoder_optimizer = self.optimizer
-                print(f"[ppo] depth PPO: encoder in the PPO optimizer (policy lr "
+                mode = "depth PPO" if self.train_depth_ppo else "dual-encoder PPO"
+                print(f"[ppo] {mode}: encoder in the PPO optimizer (policy lr "
                       f"{learning_rate:.1e}, encoder lr {depth_encoder_paras['learning_rate']:.1e}), "
                       f"aux scan coef {self.depth_aux_scan_coef}")
             else:
@@ -473,7 +473,7 @@ class PPO:
                         lr_floor_hits += int(self.learning_rate <= self.min_learning_rate * 1.0001)
 
                         for param_group in self.optimizer.param_groups:
-                            # Group 0 is the policy, group 1 (depth PPO only) the encoder;
+                            # Group 0 is the policy, group 1 (camera PPO) the encoder;
                             # the encoder keeps its own lr scale relative to the policy.
                             ratio = 1.0 if param_group is self.optimizer.param_groups[0] \
                                 else self.depth_encoder_lr_ratio
@@ -535,7 +535,7 @@ class PPO:
                             self.last_grad_norm_depth = _grad_norm(
                                 self.optimizer.param_groups[1]['params']).item()
                     diag_done = True
-                # Both parameter groups (policy, and the encoder under depth PPO).
+                # Both parameter groups (policy, and the encoder under camera PPO).
                 nn.utils.clip_grad_norm_(
                     [p for group in self.optimizer.param_groups for p in group['params']],
                     self.max_grad_norm)
@@ -581,8 +581,12 @@ class PPO:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
             old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, _depth_batch, _depth_hidden_batch, _depth_prop_batch in generator:
-                with torch.inference_mode():
-                    self.actor_critic.act(obs_batch, hist_encoding=True, masks=masks_batch, hidden_states=hid_states_batch[0])
+                # History adaptation only needs the two latent inferences below.
+                # Keep the legacy action pass for other modes, but do not require a
+                # camera latent that this dual-encoder adaptation loss never uses.
+                if not self.use_dual_encoder:
+                    with torch.inference_mode():
+                        self.actor_critic.act(obs_batch, hist_encoding=True, masks=masks_batch, hidden_states=hid_states_batch[0])
 
                 # Adaptation module update
                 with torch.inference_mode():

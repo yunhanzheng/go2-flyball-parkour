@@ -553,6 +553,11 @@ class Go2TeacherCfgPPO( Go2RoughCfgPPO ):
     class policy( Go2RoughCfgPPO.policy ):
         init_noise_std = 1.0
         max_noise_std  = 1.0
+        # The actor must receive the same dual-encoder switches as PPO. Keeping
+        # these only under algorithm leaves the actor at 114 inputs and silently
+        # discards depth_latent instead of building the 146-input fusion layer.
+        use_dual_encoder = True
+        num_depth_latent = 32
     
     class runner( Go2RoughCfgPPO.runner ):
         save_interval = 1000  # Save checkpoint every 1000 iterations

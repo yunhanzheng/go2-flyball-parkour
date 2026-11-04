@@ -174,7 +174,9 @@ class Actor(nn.Module):
                     scan_latent = scandots_latent
                 
                 # Dual-encoder mode: concatenate height and depth latents
-                if self.use_dual_encoder and depth_latent is not None:
+                if self.use_dual_encoder:
+                    if depth_latent is None:
+                        raise ValueError("dual-encoder actor requires depth_latent; run with --use_camera")
                     # Apply adaptive height weight
                     scan_latent_weighted = self.height_weight * scan_latent
                     obs_prop_scan = torch.cat([obs[:, :self.num_prop], scan_latent_weighted, depth_latent], dim=1)
@@ -199,7 +201,9 @@ class Actor(nn.Module):
                     scan_latent = scandots_latent
                 
                 # Dual-encoder mode: concatenate height and depth latents
-                if self.use_dual_encoder and depth_latent is not None:
+                if self.use_dual_encoder:
+                    if depth_latent is None:
+                        raise ValueError("dual-encoder actor requires depth_latent; run with --use_camera")
                     # Apply adaptive height weight
                     scan_latent_weighted = self.height_weight * scan_latent
                     obs_prop_scan = torch.cat([obs[:, :self.num_prop], scan_latent_weighted, depth_latent], dim=1)

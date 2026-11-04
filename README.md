@@ -22,6 +22,8 @@ Beyond upstream:
 - **Warp depth rendering** (`utils/warp_cam.py`) with a D435-style stereo-shadow model and
   configurable hole filling (`utils/depth_hole_fill.py`).
 - **Go2 model** with optional Jetson Orin payload.
+- **Dual-encoder PPO** (`go2_teacher`, `go2_flat`): height-scan and depth-image latents
+  are concatenated in the actor, with latent consistency and gated height-weight decay.
 - **Single-stage depth policy** (`go2_depth`): one PPO run on the deployable observation
   set, the depth latent standing in for the height-scan latent — no distillation stage.
   See [`go2_depth`](#go2_depth--one-policy-student-observations-teacher-rewards).
@@ -103,7 +105,9 @@ python play.py --exptid my-depth --proj_name go2-depth --task go2_depth \
 
 Play runs without domain randomization by default; pass `--full-dr` to replay with the
 training DR. Video and `--web` replays are pinned to terrain level 8 unless `--level N` or
-`--max_level` is given.
+`--max_level` is given. The released teacher/flat checkpoints use the legacy 114-D actor
+and require their matching legacy policy configuration; current dual-encoder runs require
+`--use_camera` and a 146-D checkpoint.
 
 Replay flags: `--video`, `--web`, `--level N`, `--full-dr`, `--all_rough` (every tile on the
 rough curriculum), `--overlays` (foothold goals and hurdle-clearance volumes),
@@ -113,27 +117,29 @@ rough curriculum), `--overlays` (foothold goals and hurdle-clearance volumes),
 
 | task | config | |
 |---|---|---|
-| `go2_teacher` | `Go2TeacherCfg` | privileged: scandots + full state |
+| `go2_teacher` | `Go2TeacherCfg` | dual encoder: height scan + depth image + full-state critic |
+| `go2_flat` | `Go2FlatCfg` | flat-ground PPO with the same dual-encoder actor |
 | `go2_student` | `Go2StudentCfg` | depth camera, distilled from a teacher |
 | `go2_depth` | `Go2DepthCfg` | depth camera, **one stage**: student observations + teacher rewards |
 
 ```bash
-# teacher
-python train.py --task go2_teacher --exptid my-teacher --device cuda:0 --headless
+# true dual-encoder flat policy, from scratch (requires a camera)
+python train.py --task go2_flat --exptid go2-flat-512-v4-dual \
+    --use_camera --max_iterations 5000 --headless --no_wandb --device cuda:0
 
-# student, distilled from a trained teacher
+# dual-encoder teacher
+python train.py --task go2_teacher --exptid my-teacher --device cuda:0 \
+    --use_camera --headless
+
+# student, distilled from a legacy 114-D teacher
 python train.py --task go2_student --exptid my-student --device cuda:0 \
-    --resume --resumeid my-teacher --use_camera --delay
-
-# warm start from the released flat-terrain base policy
-python train.py --task go2_teacher --exptid new-run \
-    --resume --resumeid flat_baseline --device cuda:0 --headless
+    --resume --resumeid teacher --use_camera --delay
 
 # single-stage depth policy, from scratch
 python train.py --task go2_depth --exptid my-depth --proj_name go2-depth \
     --use_camera --delay --headless --device cuda:0
 
-# ... or warm started from the privileged teacher (the actor is the same network)
+# ... or warm started from a legacy 114-D privileged teacher
 python train.py --task go2_depth --exptid my-depth --proj_name go2-depth \
     --resume --resumeid teacher --use_camera --delay --headless --device cuda:0
 ```
@@ -146,6 +152,36 @@ Runs log to Weights & Biases (`wandb login` once; `--no_wandb` or `--debug` disa
 `--proj_name` doubles as the W&B project, `--exptid` as the run name. Because
 `wandb.init(dir="../../logs")` is relative, `train.py` must be started from
 `legged_gym/legged_gym/scripts`.
+
+#### Dual-encoder PPO — height scan and depth image
+
+`go2_teacher` and `go2_flat` use two perception encoders in the **main PPO actor**. The
+height encoder and depth encoder each produce a 32-D latent; the actor consumes
+`concat(height_weight * latent_h, latent_d)`. Its input is therefore **146-D**: 53 proprio
++ 32 height latent + 32 depth latent + 9 explicit privileged state + 20 history latent.
+The critic retains its privileged observation.
+
+The depth encoder is a second parameter group in the optimizer that actually performs
+the PPO step. Training also minimizes `MSE(latent_h, latent_d)`; `height_weight` decays by
+`height_decay_rate` only when the success-rate EMA, mean curriculum level and consistency
+EMA all pass their configured gates. The weight is stored in each checkpoint. On flat
+ground it normally remains `1.0`, because the curriculum-level gate is not met.
+
+This path is distinct from DAgger and `go2_depth`: those still use one depth latent through
+`scandots_latent`, replacing the height latent rather than concatenating with it. Dual PPO
+uses `actor_critic.actor` and raw teacher observations for the actor; heading blanking is
+applied only to the depth encoder's proprioceptive input. `play.py` and `evaluate.py`
+mirror that wiring.
+
+The current flat run is `go2-flat-512-v4-dual`, launched by
+`legged_gym/logs/launch_flat.sh`. Its logs and checkpoints are under
+`legged_gym/logs/extreme-parkour/go2-flat-512-v4-dual/`.
+
+> [!IMPORTANT]
+> Dual-encoder PPO requires `--use_camera`. Older teacher/flat checkpoints with a 114-D
+> actor cannot be loaded into the 146-D actor; start a new run without `--resume`.
+> `save_jit.py` currently targets the DAgger student export path and is not yet a dual-
+> encoder export implementation.
 
 #### `go2_depth` — one policy, student observations, teacher rewards
 
@@ -161,8 +197,9 @@ The release trains two networks in sequence: a privileged `go2_teacher`, then a
 | encoder | a second parameter group inside the PPO optimizer (`depth_encoder.learning_rate`) |
 
 The 32-D depth latent is fed through `scandots_latent`, i.e. it **replaces** the output of
-the actor's own scan encoder. That is what keeps the actor network byte-identical to the
-teacher's, so `--resume --resumeid teacher` is a real warm start rather than a shape match.
+the actor's own scan encoder. That keeps the actor network byte-identical to a **legacy
+114-D teacher**, so `--resume --resumeid teacher` is a real warm start rather than a shape
+match. A new 146-D dual-encoder teacher is not shape-compatible with this path.
 
 Three details make it hold together:
 
@@ -200,7 +237,9 @@ lateral-deviation termination still enforces the corridor from depth alone.
 
 `legged_gym/legged_gym/tests/test_depth_ppo_plumbing.py` guards this wiring on CPU, without
 Isaac Gym: cached frames must not be inference tensors, gradients must reach the encoder,
-the aux loss must stay finite, and the teacher / DAgger paths must be untouched.
+the aux loss must stay finite, and the teacher / DAgger paths must be untouched. Dual-encoder
+tests also cover the 146-D actor, mandatory depth latent, encoder updates, history adaptation
+and inference-actor selection.
 
 ```bash
 python -m pytest legged_gym/legged_gym/tests/test_depth_ppo_plumbing.py -s

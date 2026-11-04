@@ -1168,6 +1168,12 @@ def play(args):
         print(f"[play] --yaw_sentinel_hold: post-sentinel yaw max-pin ON "
               f"(hold={hold_s:.2f}s, curriculum gate→0; affects --rew only)")
 
+    # Low-velocity termination is a training aid for stalled episodes. During play,
+    # let a stationary policy remain observable instead of resetting it after 2 s.
+    if getattr(env_cfg.env, "terminate_on_low_velocity", False):
+        env_cfg.env.terminate_on_low_velocity = False
+        print("[play] low-velocity termination OFF (training-only stall detection)")
+
     # Camera sensors (mp4, --web) need a render context that base_task switches off
     # under --headless (handles come back -1, frames vanish). It is offscreen Vulkan.
     if _need_viewer:
@@ -1332,10 +1338,16 @@ def play(args):
 
     train_cfg.runner.resume = True
     ppo_runner, train_cfg, log_pth = task_registry.make_alg_runner(log_root = resolved_log_pth, env=env, name=args.task, args=args, train_cfg=train_cfg, return_log_dir=True)
-    
-    
-    
-    
+
+    _height_weight_override = os.environ.get("PLAY_HEIGHT_WEIGHT")
+    if _height_weight_override is not None:
+        actors = [ppo_runner.alg.actor_critic.actor,
+                  getattr(ppo_runner.alg, "depth_actor", None)]
+        for actor in actors:
+            if actor is not None:
+                actor.height_weight = float(_height_weight_override)
+        print(f"[play] diagnostic height_weight override: {float(_height_weight_override):.3f}")
+
     if args.use_jit:
         path = os.path.join(log_pth, "traced")
         model, checkpoint = get_load_path(root=path, checkpoint=args.checkpoint)
@@ -1569,6 +1581,13 @@ def play(args):
             print(f"[play] step {i + 1}/{num_steps}  "
                   f"{_rate:.1f} steps/s  elapsed {_el:.0f}s  eta {_eta:.0f}s",
                   flush=True)
+            if os.environ.get("PLAY_DEBUG_MOTION"):
+                _eid = env.lookat_id
+                print(f"[play-motion] env={_eid} "
+                      f"dx={float(env.root_states[_eid, 0] - env.env_origins[_eid, 0]):+.3f} "
+                      f"dy={float(env.root_states[_eid, 1] - env.env_origins[_eid, 1]):+.3f} "
+                      f"vx={float(env.root_states[_eid, 7]):+.3f} "
+                      f"cmd_x={float(env.commands[_eid, 0]):+.3f}", flush=True)
         if args.use_jit:
             if ppo_runner.if_depth:
                 if infos["depth"] is not None:
@@ -1582,9 +1601,14 @@ def play(args):
                 actions = policy(obs_jit)
         else:
             obs_student = obs.detach()
+            dual_encoder = getattr(ppo_runner.alg, "use_dual_encoder", False)
             if ppo_runner.if_depth:
-                teacher_obs, obs_student = _distillation_student_obs(obs.detach())
+                if not dual_encoder:
+                    teacher_obs, obs_student = _distillation_student_obs(obs.detach())
                 if infos["depth"] is not None:
+                    # Both training paths blank heading only for the depth encoder.
+                    # Dual PPO keeps the original actor obs; DAgger/depth PPO applies
+                    # its deploy-side student transform separately above/below.
                     obs_prop_depth = obs_student[:, :env.cfg.env.n_proprio].clone()
                     obs_prop_depth[:, 6:8] = 0
                     depth_out = depth_encoder(infos["depth"], obs_prop_depth)
@@ -1595,31 +1619,34 @@ def play(args):
                     else:
                         depth_latent = depth_out
                         _pred_yaw = None
-                if getattr(ppo_runner, "use_yaw", False) and _pred_yaw is not None:
-                    obs_student[:, 6:8] = _pred_yaw
-                else:
-                    obs_student[:, 6:8] = 0
+                if not dual_encoder:
+                    if getattr(ppo_runner, "use_yaw", False) and _pred_yaw is not None:
+                        obs_student[:, 6:8] = _pred_yaw
+                    else:
+                        obs_student[:, 6:8] = 0
 
             else:
                 depth_latent = None
-            
-            if hasattr(ppo_runner.alg, "depth_actor"):
-                actions = ppo_runner.alg.depth_actor(obs_student, hist_encoding=True, scandots_latent=depth_latent)
+
+            if dual_encoder:
+                actor_kwargs = {"scandots_latent": None, "depth_latent": depth_latent}
             else:
-                actions = policy(obs_student, hist_encoding=True, scandots_latent=depth_latent)
-                if args.dump_actor:
-                    if not hasattr(env, "_play_dump_idx"):
-                        env._play_dump_idx = 0
-                    if env._play_dump_idx < 5:
-                        if env._play_dump_idx == 0:
-                            torch.save(ppo_runner.alg.actor_critic.state_dict(), "/tmp/play_actor_state.pt")
-                            actions_via_actor_call = ppo_runner.alg.actor_critic.actor(obs_student, hist_encoding=True, eval=False, scandots_latent=depth_latent)
-                            print(f"[play_dump] direct actor call action_norm={float(actions_via_actor_call.norm()):.3f}")
-                        np.savez(f"/tmp/play_step_{env._play_dump_idx}.npz",
-                                 obs_into_policy=obs_student[0].cpu().numpy(),
-                                 actions_out=actions.detach()[0].cpu().numpy())
-                        print(f"[play_dump] step {env._play_dump_idx}: action_norm={float(actions.norm()):.3f}")
-                        env._play_dump_idx += 1
+                actor_kwargs = {"scandots_latent": depth_latent}
+            actions = policy(obs_student, hist_encoding=True, **actor_kwargs)
+            if args.dump_actor:
+                if not hasattr(env, "_play_dump_idx"):
+                    env._play_dump_idx = 0
+                if env._play_dump_idx < 5:
+                    if env._play_dump_idx == 0:
+                        torch.save(ppo_runner.alg.actor_critic.state_dict(), "/tmp/play_actor_state.pt")
+                        actions_via_actor_call = ppo_runner.alg.actor_critic.actor(
+                            obs_student, hist_encoding=True, eval=False, **actor_kwargs)
+                        print(f"[play_dump] direct actor call action_norm={float(actions_via_actor_call.norm()):.3f}")
+                    np.savez(f"/tmp/play_step_{env._play_dump_idx}.npz",
+                             obs_into_policy=obs_student[0].cpu().numpy(),
+                             actions_out=actions.detach()[0].cpu().numpy())
+                    print(f"[play_dump] step {env._play_dump_idx}: action_norm={float(actions.norm()):.3f}")
+                    env._play_dump_idx += 1
             
         if _vel_profile_segments:
             cur_vel, cur_dur = _vel_profile_segments[_vp_seg_idx]
