@@ -893,6 +893,9 @@ class LeggedRobot(BaseTask):
 
         self.check_termination()
         self.compute_reward()
+        # Episode metrics describe one reset batch. Clear the previous batch so
+        # steps without a reset do not expose and log the same episode twice.
+        self.extras.pop("episode", None)
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)
 
@@ -1023,12 +1026,17 @@ class LeggedRobot(BaseTask):
 
         # Low-velocity termination (opt-in via cfg.env.terminate_on_low_velocity): terminate when |vel_x| stays below threshold for too many consecutive steps.
         # Useful for detecting when the robot stalls in front of an obstacle (e.g., hurdle or wall) and stops making progress.
+        # Only active when cmd > threshold (avoid terminating during standstill commands).
         low_vel_cutoff = torch.zeros_like(roll_cutoff)
         if bool(getattr(self.cfg.env, 'terminate_on_low_velocity', False)):
             vel_thresh = float(getattr(self.cfg.env, 'low_velocity_term_mps', 0.1))
             dur_steps = int(getattr(self.cfg.env, 'low_velocity_term_duration_steps', 50))  # default 2s @ 25Hz
+            cmd_thresh = float(getattr(self.cfg.env, 'low_velocity_cmd_thresh', 0.1))  # only terminate if cmd > this
             vel_x = torch.abs(self.root_states[:, 7])  # linear velocity x
+            cmd_x = torch.abs(self.commands[:, 0])  # command velocity x
             is_slow = vel_x < vel_thresh
+            cmd_active = cmd_x > cmd_thresh  # only count when commanded to move
+            is_slow = is_slow & cmd_active  # combine: slow AND commanded to move
             self.low_vel_steps = torch.where(is_slow, self.low_vel_steps + 1, torch.zeros_like(self.low_vel_steps))
             low_vel_cutoff = self.low_vel_steps >= dur_steps
 
@@ -1422,6 +1430,7 @@ class LeggedRobot(BaseTask):
             _c[self.term_wococo_stage1_ground[env_ids]]    = 10
             _c[self.term_wococo_stage2_overshoot[env_ids]] = 11
             _c[self.term_behind_wall[env_ids]]             = 12
+            _c[self.term_low_vel[env_ids]]                 = 13
             _c[self.term_roll[env_ids]]           = 1   # roll assigned last → wins ties (wall-plant cause)
             self.last_term_code[env_ids] = _c
         self.obs_history_buf[env_ids, :, :] = 0.  # reset obs history buffer TODO no 0s
@@ -1617,6 +1626,9 @@ class LeggedRobot(BaseTask):
 
         if self.cfg.terrain.curriculum:
             self.extras["episode"]["terrain_level"] = torch.mean(self.terrain_levels.float())
+            self.extras["episode"]["terrain_level_frontier"] = self._frontier_mean_level()
+            self.extras["episode"]["terrain_level_max"] = torch.max(self.terrain_levels.float())
+            self.extras["episode"]["terrain_level_min"] = torch.min(self.terrain_levels.float())
             if getattr(self.cfg.rewards,
                        'wococo_stage_anneal_start_mean_level', None) is not None:
                 self.extras["episode"]["stage_anneal_frac"] = torch.tensor(
@@ -1710,11 +1722,21 @@ class LeggedRobot(BaseTask):
             self.extras["episode"][f"wococo/stage_{_stage_idx}_unlocked_frac"] = (
                 self.wococo_stage_unlocked[:, _stage_idx].float().mean())
 
+        # Exact per-env success accounting for the dual-encoder adaptive decay.
+        # The constructor's initial fleet reset is not a completed episode: before
+        # check_termination() there is no term_reach_goal, so both counts stay zero.
+        has_reach_goal = hasattr(self, 'term_reach_goal')
+        self.extras["episode"]["reset_env_count"] = torch.tensor(
+            float(len(env_ids)) if has_reach_goal else 0.0, device=self.device)
+        self.extras["episode"]["reach_goal_count"] = (
+            self.term_reach_goal[env_ids].float().sum() if has_reach_goal
+            else torch.tensor(0.0, device=self.device))
+
         # Per-cause termination rates among envs resetting this step (diagnoses short-episode pathologies).
         for key in ("term_roll", "term_pitch", "term_height",
                     "term_base_contact", "term_reach_goal", "term_timeout",
                     "term_yaw_tracking", "term_plant_dwell",
-                    "term_lateral", "term_behind_wall"):
+                    "term_lateral", "term_low_vel", "term_behind_wall"):
             if hasattr(self, key):
                 self.extras["episode"][key] = getattr(self, key)[env_ids].float().mean()
         # Plant-failure early terminations, with the curriculum arm-latch state (0 until the fleet reaches the arm level).
@@ -2947,6 +2969,7 @@ class LeggedRobot(BaseTask):
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
         self.last_contacts_obs = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
         self.contact_thresh = torch.full((self.num_envs, len(self.feet_indices)), 2., device=self.device, requires_grad=False)
+        self.feet_air_time = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.float, device=self.device, requires_grad=False)
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
@@ -3949,6 +3972,54 @@ class LeggedRobot(BaseTask):
         rew = torch.where(silence, torch.zeros_like(rew), rew)
         self.yaw_prev = self.yaw.clone()
         return rew
+
+    def _reward_tracking_lin_vel(self):
+        """Reward for tracking linear velocity command in x direction.
+        
+        Uses exponential kernel: exp(-error^2 / sigma).
+        Only applied on flat terrain (disabled for obstacle negotiation).
+        """
+        cmd_vel_x = self.commands[:, 0]
+        actual_vel_x = self.base_lin_vel[:, 0]
+        vel_error_sq = torch.square(cmd_vel_x - actual_vel_x)
+        sigma = float(getattr(self.cfg.rewards, 'tracking_sigma', 0.25))
+        rew = torch.exp(-vel_error_sq / sigma)
+        # Only apply on flat terrain
+        flat_mask = self._flat_terrain_mask()
+        rew = rew * flat_mask.float()
+        return rew
+
+    def _reward_tracking_ang_vel(self):
+        """Reward for tracking angular velocity command in z direction (yaw rate).
+        
+        Uses exponential kernel: exp(-|cmd - actual| / sigma).
+        Only applied on flat terrain (disabled for obstacle negotiation).
+        """
+        cmd_vel_z = self.commands[:, 2]
+        actual_vel_z = self.base_ang_vel[:, 2]
+        vel_error = torch.abs(cmd_vel_z - actual_vel_z)
+        sigma = float(getattr(self.cfg.rewards, 'tracking_sigma', 0.25))
+        rew = torch.exp(-vel_error / sigma)
+        # Only apply on flat terrain
+        flat_mask = self._flat_terrain_mask()
+        rew = rew * flat_mask.float()
+        return rew
+
+    def _reward_feet_air_time(self):
+        """Reward long swing phases (encourages natural gait).
+        
+        From unitree_rl_gym: rewards feet being in the air, only on first contact.
+        """
+        contact = self.contact_forces[:, self.feet_indices, 2] > 1.
+        contact_filt = torch.logical_or(contact, self.last_contacts)
+        self.last_contacts = contact
+        first_contact = (self.feet_air_time > 0.) * contact_filt
+        self.feet_air_time += self.dt
+        rew_air_time = torch.sum((self.feet_air_time - 0.5) * first_contact, dim=1)
+        # Only reward when there's a movement command
+        rew_air_time *= torch.norm(self.commands[:, :2], dim=1) > 0.1
+        self.feet_air_time *= ~contact_filt
+        return rew_air_time
      
     def _reward_orientation(self):
         rew = torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)

@@ -554,13 +554,17 @@ class Go2TeacherCfgPPO( Go2RoughCfgPPO ):
         init_noise_std = 1.0
         max_noise_std  = 1.0
     
-    # Dual-encoder consistency loss configuration
-    use_dual_encoder = True  # Enable dual-encoder mode (height + depth)
-    consistency_loss_weight = 0.1  # Weight for latent consistency loss
-    num_depth_latent = 32  # Dimension of depth latent
+    class runner( Go2RoughCfgPPO.runner ):
+        save_interval = 1000  # Save checkpoint every 1000 iterations
     
-    # Adaptive height weight decay triggers
-    height_decay_trigger_success_rate = 0.5  # Min success rate to start decay
-    height_decay_trigger_mean_level = 2  # Min terrain level to start decay
-    height_decay_trigger_consistency = 0.1  # Max latent consistency to start decay
-    height_decay_rate = 0.995  # Decay rate per trigger (0.995 = 0.5% per decay)
+    class algorithm( Go2RoughCfgPPO.algorithm ):
+        # Dual-encoder consistency loss configuration
+        use_dual_encoder = True  # Enable dual-encoder mode (height + depth)
+        consistency_loss_weight = 0.1  # Weight for latent consistency loss
+        num_depth_latent = 32  # Dimension of depth latent
+        
+        # Adaptive height weight decay triggers
+        height_decay_trigger_success_rate = 0.5  # Min success rate to start decay
+        height_decay_trigger_mean_level = 2  # Min terrain level to start decay
+        height_decay_trigger_consistency = 0.1  # Max latent consistency to start decay
+        height_decay_rate = 0.995  # Decay rate per trigger (0.995 = 0.5% per decay)

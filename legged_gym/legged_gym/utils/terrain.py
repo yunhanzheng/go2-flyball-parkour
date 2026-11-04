@@ -38,6 +38,7 @@ from numpy.random import choice
 from scipy import interpolate
 import random
 from isaacgym import terrain_utils
+import legged_gym.utils.flyball_wall as flyball_wall_generator
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
 from scipy import ndimage
 from pydelatin import Delatin
@@ -61,6 +62,14 @@ _CACHE_KEY_SKIP = frozenset({
 # RNG state captured *after* a cold build, replayed on a hit so the rest of the
 # process sees the same random stream either way.
 _CACHE_RNG_KEY = '__rng_after_build__'
+
+# Terrain geometry depends on generator code as well as cfg + RNG. Including
+# these files in the key makes every old pickle miss automatically after an edit.
+_CACHE_GENERATOR_FILES = (
+    __file__,
+    flyball_wall_generator.__file__,
+    terrain_utils.__file__,
+)
 
 class Terrain:
     def __init__(self, cfg: LeggedRobotCfg.terrain, num_robots) -> None:
@@ -117,10 +126,11 @@ class Terrain:
     def _cache_path(self):
         """Pickle path for this exact terrain, or None when caching is off.
 
-        The key covers every cfg.terrain field reachable through the class MRO plus
-        numpy's RNG state, because make_terrain draws hurdle heights/positions from
-        the global RNG. Hashing the live state (instead of trusting a fixed seed)
-        means a different seed can only cause a miss, never a stale hit.
+        The key covers every cfg.terrain field reachable through the class MRO,
+        the terrain-generator source files, and numpy's RNG state, because
+        make_terrain draws hurdle heights/positions from the global RNG. Hashing
+        the live state means a different seed or generator can only cause a miss,
+        never a stale hit.
         """
         if not bool(getattr(self.cfg, 'use_cache', True)):
             return None
@@ -139,6 +149,10 @@ class Terrain:
                 if callable(value) or isinstance(value, type):
                     continue
                 digest.update(repr((key, value)).encode())
+            for source_path in _CACHE_GENERATOR_FILES:
+                digest.update(os.path.basename(source_path).encode())
+                with open(source_path, 'rb') as source_file:
+                    digest.update(source_file.read())
             rng_state = np.random.get_state()
             digest.update(np.asarray(rng_state[1], dtype=np.uint32).tobytes())
             digest.update(str(rng_state[2]).encode())
@@ -939,6 +953,7 @@ class Terrain:
                 hurdle_offset_jitter=getattr(self.cfg, 'flyball_single_hurdle_offset_jitter', 0.3),
                 post_hurdle_goal_distance=getattr(self.cfg, 'flyball_post_hurdle_goal_distance', 0.6),
                 add_second_hurdle=getattr(self.cfg, 'flyball_add_second_hurdle', False),
+                single_hurdle_prob=getattr(self.cfg, 'flyball_single_hurdle_prob', 0.0),
                 second_hurdle_offset=getattr(self.cfg, 'flyball_second_hurdle_offset', 2.0),
                 second_hurdle_offset_jitter=getattr(self.cfg, 'flyball_second_hurdle_offset_jitter', 0.3),
                 spawn_x=getattr(self.cfg, 'flyball_spawn_x', 1.0),

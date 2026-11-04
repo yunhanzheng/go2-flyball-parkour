@@ -198,6 +198,9 @@ def flyball_wall_terrain(
     # Second obstacle `second_hurdle_offset` metres past hurdle 1's rear
     # face, so the policy must clear two hurdles before the wall takeoff.
     add_second_hurdle: bool            = False,
+    # Probability of having only 1 hurdle (instead of 2) when add_second_hurdle=True.
+    # Creates 0/1/2 hurdle distribution: zero_prob → 0 hurdles, (1-zero_prob)*single_prob → 1 hurdle, rest → 2.
+    single_hurdle_prob: float          = 0.0,
     second_hurdle_offset: float        = 2.0,
     second_hurdle_offset_jitter: float = 0.3,
     # Compact-course placement: spawn->hurdle-front and hurdle-rear->wall-toe are
@@ -317,9 +320,11 @@ def flyball_wall_terrain(
         return th
 
     hurdle_thickness_m = _sample_hurdle_thickness_m()
+    # Hurdle count diversity: decide early whether to use second hurdle (affects thickness sampling and build logic).
+    _use_second_hurdle = add_second_hurdle and (single_hurdle_prob <= 0.0 or float(np.random.uniform()) >= single_hurdle_prob)
     hurdle2_thickness_m = (
         _sample_hurdle_thickness_m()
-        if add_hurdle and add_second_hurdle
+        if add_hurdle and _use_second_hurdle
         else hurdle_thickness_m
     )
 
@@ -368,7 +373,7 @@ def flyball_wall_terrain(
         compact_hx_b = clamp(compact_hx_a + thk_px, compact_hx_a + 1, terrain.width)
 
         last_hurdle_back_px = compact_hx_b
-        if add_second_hurdle:
+        if _use_second_hurdle:
             gap_m = float(second_hurdle_offset)
             if second_hurdle_offset_jitter > 0.0:
                 gap_m += float(np.random.uniform(
@@ -529,7 +534,7 @@ def flyball_wall_terrain(
         hurdle_width_m, hy_a, hy_b = _sample_hurdle_y_span()
         hurdle2_width_m, hy2_a, hy2_b = (
             _sample_hurdle_y_span()
-            if add_second_hurdle
+            if _use_second_hurdle
             else (hurdle_width_m, hy_a, hy_b)
         )
         # lerp(floor, ceiling, difficulty), then a per-tile draw in [floor, amp_max].
@@ -579,7 +584,7 @@ def flyball_wall_terrain(
         last_hx_b = hx_b
 
         # Hurdle 2: own jitter; height, thickness and width sampled independently.
-        if add_second_hurdle:
+        if _use_second_hurdle:
             if compact_layout:
                 hx2_a, hx2_b = compact_hx2_a, compact_hx2_b
             else:
@@ -629,7 +634,7 @@ def flyball_wall_terrain(
         g_takeoff_x = max(g_takeoff_x, hurdle_rear_x)
         g_land_x = max(g_land_x, g_return_x)
 
-    if end_after_hurdles:
+    if end_after_hurdles and _use_second_hurdle:
         # Reaching g1 advances cur_goal_idx to num_goals -> reach-goal termination.
         h1_back_x = float(hx_b) * hs
         h2_front_x = float(hx2_a) * hs
@@ -639,7 +644,7 @@ def flyball_wall_terrain(
             0.0, (terrain.width - 1) * hs)
         goals[0] = [between_x, mid_y * hs, platform_height]
         goals[1] = [finish_x,  mid_y * hs, platform_height]
-    elif add_hurdle and add_second_hurdle:
+    elif add_hurdle and _use_second_hurdle:
         # Two-hurdle layout: g0 between-hurdles forward, g1 takeoff, g2 contact,
         # g3 landing, g4 between-hurdles backward, g5 return, g6/g7 padded to g5.
         # Goal-index gates (takeoff=1, contact=2, landing=3) match the legacy
@@ -693,7 +698,7 @@ def flyball_wall_terrain(
         goals[6] = goals[4]
         goals[7] = goals[4]
 
-    if not (add_hurdle and add_second_hurdle):
+    if not (add_hurdle and _use_second_hurdle):
         # Push the final return goals (index >= 4) 2 m further in -x, past the start
         # platform, before the circuit ends.
         final_goal_shift_x = -2.0
@@ -742,11 +747,11 @@ def flyball_wall_terrain(
     terrain.wall_delta_x = float(delta_x)
     # Exact realised geometry (after heightfield quantisation), for debug tooling.
     terrain.hurdle_thickness_m = float(thk_px * hs)
-    terrain.hurdle2_thickness_m = float(thk2_px * hs) if (add_hurdle and add_second_hurdle) else 0.0
+    terrain.hurdle2_thickness_m = float(thk2_px * hs) if (add_hurdle and _use_second_hurdle) else 0.0
     terrain.hurdle_height_m = float(h1_m) if add_hurdle else 0.0
-    terrain.hurdle2_height_m = float(h2_m) if (add_hurdle and add_second_hurdle) else 0.0
+    terrain.hurdle2_height_m = float(h2_m) if (add_hurdle and _use_second_hurdle) else 0.0
     terrain.hurdle_width_m = float((hy_b - hy_a) * hs) if add_hurdle else 0.0
-    terrain.hurdle2_width_m = float((hy2_b - hy2_a) * hs) if (add_hurdle and add_second_hurdle) else 0.0
+    terrain.hurdle2_width_m = float((hy2_b - hy2_a) * hs) if (add_hurdle and _use_second_hurdle) else 0.0
     terrain.hurdle_front_from_spawn_m = (
         float(hx_a * hs - spawn_x) if add_hurdle else 0.0)
     terrain.wall_to_hurdle_rear_m = (

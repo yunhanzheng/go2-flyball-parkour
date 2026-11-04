@@ -351,7 +351,7 @@ class Go2RoughCfg( LeggedRobotCfg ):
         slope_treshold = 11.43
         origin_zero_z = True
         num_goals = 8
-        # Terrain mix — exclusive flyball_box training
+        # Terrain mix — flyball wall training (default)
         terrain_dict = {"smooth slope": 0.,
                         "rough slope up": 0.,
                         "rough slope down": 0.,
@@ -360,17 +360,17 @@ class Go2RoughCfg( LeggedRobotCfg ):
                         "discrete": 0.,
                         "stepping stones": 0.,
                         "gaps": 0.,
-                        "smooth flat": 0.0,
+                        "smooth flat": 0.0,  # No flat ground
                         "parkour_stones": 0.,
                         "wall": 0.,
                         "platform": 0.,
                         "large stairs up": 0.,
                         "large stairs down": 0.,
                         "parkour": 0.,
-                        "two_hurdles_wall_turn": 0., # exclusive training terrain
+                        "two_hurdles_wall_turn": 0.,
                         "parkour_flat": 0.,
                         "parkour_step": 0.,
-                        "flyball_box": 1.,       # wall-turn training terrain
+                        "flyball_box": 1.0,  # 100% flyball wall terrain
                         "demo": 0.,
                         }
         terrain_proportions = list(terrain_dict.values())

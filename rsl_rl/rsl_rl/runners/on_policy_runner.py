@@ -33,7 +33,7 @@ import os
 from collections import deque
 import statistics
 
-# from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.optim as optim
 import wandb
@@ -127,7 +127,11 @@ class OnPolicyRunner:
         )
 
         if self.if_depth:
-            self.learn = self.learn_depth_ppo if self.train_depth_ppo else self.learn_vision
+            # Dual encoder mode uses learn_RL with depth support, not learn_vision/learn_depth_ppo
+            if getattr(self.alg, 'use_dual_encoder', False):
+                self.learn = self.learn_RL
+            else:
+                self.learn = self.learn_depth_ppo if self.train_depth_ppo else self.learn_vision
         else:
             self.learn = self.learn_RL
             
@@ -164,6 +168,39 @@ class OnPolicyRunner:
         lenbuffer.extend(packed[1][done_np].tolist())
         return int(rews.shape[0])
 
+    @staticmethod
+    def _dual_encoder_update_info(ep_infos):
+        """Aggregate task metrics for adaptive height-weight decay.
+
+        Each ep_info summarizes one reset batch, not one episode. Weight the
+        reach-goal counts by reset_env_count so a large batch and a single-env
+        batch contribute their actual numbers of finished environments.
+        """
+        info = {}
+        if not ep_infos:
+            return info
+
+        counted = [ep for ep in ep_infos
+                   if 'reset_env_count' in ep and 'reach_goal_count' in ep]
+        if counted:
+            reset_count = sum(ep['reset_env_count'] for ep in counted)
+            reach_count = sum(ep['reach_goal_count'] for ep in counted)
+            reset_value = (reset_count.item() if torch.is_tensor(reset_count)
+                           else float(reset_count))
+            reach_value = (reach_count.item() if torch.is_tensor(reach_count)
+                           else float(reach_count))
+            info['success_rate'] = (
+                reach_value / reset_value if reset_value > 0 else 0.0)
+        else:
+            # Compatibility for VecEnvs that still report per-episode is_success.
+            success_count = sum(
+                1 for ep in ep_infos if ep.get('is_success', False))
+            info['success_rate'] = success_count / len(ep_infos)
+
+        info['mean_level'] = (
+            sum(ep.get('terrain_level', 0) for ep in ep_infos) / len(ep_infos))
+        return info
+
     def _distillation_observations(self, obs):
         """Return untouched teacher observations and deploy-like student observations."""
         teacher_obs = obs
@@ -190,8 +227,8 @@ class OnPolicyRunner:
         priv_reg_coef = 0.
         entropy_coef = 0.
         # initialize writer
-        # if self.log_dir is not None and self.writer is None:
-        #     self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+        if self.log_dir is not None and self.writer is None:
+            self.writer = SummaryWriter(log_dir=os.path.join(self.log_dir, 'tb'), flush_secs=10)
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=int(self.env.max_episode_length))
         obs = self.env.get_observations()
@@ -200,6 +237,10 @@ class OnPolicyRunner:
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         infos = {}
         infos["depth"] = self.env.depth_buffer.clone().to(self.device) if self.if_depth else None
+        # Dual encoder: initialize depth latent tracking
+        depth_latent, depth_frame, depth_hidden, depth_prop = None, None, None, None
+        if getattr(self.alg, 'use_dual_encoder', False) and self.if_depth:
+            infos["depth"] = (self.env.get_depth_obs().to(self.device) if self.if_depth else None)
         self.alg.actor_critic.train() # switch to train mode (for dropout for example)
 
         ep_infos = []
@@ -225,7 +266,16 @@ class OnPolicyRunner:
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
-                    actions = self.alg.act(obs, critic_obs, infos, hist_encoding)
+                    # Dual encoder: compute depth_latent at 10 Hz cadence
+                    if getattr(self.alg, 'use_dual_encoder', False) and self.if_depth and infos.get("depth", None) is not None:
+                        depth_latent, depth_frame, depth_hidden, depth_prop = self._depth_tick(
+                            obs, infos["depth"])
+                    
+                    actions = self.alg.act(obs, critic_obs, infos, hist_encoding, 
+                                          depth_latent=depth_latent,
+                                          depth_img=depth_frame,
+                                          depth_hidden=depth_hidden,
+                                          depth_prop=depth_prop)
                     obs, privileged_obs, rewards, dones, infos = self.env.step(actions)  # obs has changed to next_obs !! if done obs has been reset
                     critic_obs = privileged_obs if privileged_obs is not None else obs
                     obs, critic_obs, rewards, dones = obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
@@ -264,7 +314,10 @@ class OnPolicyRunner:
                 start = stop
                 self.alg.compute_returns(critic_obs)
             
-            mean_value_loss, mean_surrogate_loss, mean_estimator_loss, mean_disc_loss, mean_disc_acc, mean_priv_reg_loss, priv_reg_coef = self.alg.update()
+            # Collect info for dual-encoder adaptive decay
+            info_for_update = self._dual_encoder_update_info(ep_infos)
+            
+            mean_value_loss, mean_surrogate_loss, mean_estimator_loss, mean_disc_loss, mean_disc_acc, mean_priv_reg_loss, priv_reg_coef = self.alg.update(info_for_update)
             if hist_encoding:
                 print("Updating dagger...")
                 mean_hist_latent_loss = self.alg.update_dagger()
@@ -410,7 +463,10 @@ class OnPolicyRunner:
                 start = stop
                 self.alg.compute_returns(critic_obs)
 
-            mean_value_loss, mean_surrogate_loss, mean_estimator_loss, mean_disc_loss, mean_disc_acc, mean_priv_reg_loss, priv_reg_coef = self.alg.update()
+            # Collect info for dual-encoder adaptive decay (if applicable)
+            info_for_update = self._dual_encoder_update_info(ep_infos)
+
+            mean_value_loss, mean_surrogate_loss, mean_estimator_loss, mean_disc_loss, mean_disc_acc, mean_priv_reg_loss, priv_reg_coef = self.alg.update(info_for_update)
             # The encoder is trained inside update(); there is no DAgger pass to run.
             stop = time.time()
             learn_time = stop - start
@@ -583,8 +639,20 @@ class OnPolicyRunner:
                     if len(ep_info[key].shape) == 0:
                         ep_info[key] = ep_info[key].unsqueeze(0)
                     infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
-                value = torch.mean(infotensor)
-                wandb_key = key if key.startswith('wococo/') else 'Episode_rew/' + key
+                value = torch.mean(infotensor).item()
+                # Categorize episode metrics for better TB organization
+                if key.startswith('wococo/'):
+                    wandb_key = key
+                elif key.startswith('term_'):
+                    wandb_key = f'Termination/{key}'
+                elif key == 'terrain_level' or key.startswith('terrain_level'):
+                    wandb_key = f'Curriculum/{key}'
+                elif key in ['stage_anneal_frac', 'dr_scale_mean', 'dr_scale_max', 'dr_ramp_armed']:
+                    wandb_key = f'Curriculum/{key}'
+                elif key.startswith('rew_'):
+                    wandb_key = f'Reward/{key}'
+                else:
+                    wandb_key = f'Episode/{key}'
                 wandb_dict[wandb_key] = value
                 ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
         mean_std = self.alg.actor_critic.std.mean()
@@ -650,74 +718,67 @@ class OnPolicyRunner:
                     if len(ep_info[key].shape) == 0:
                         ep_info[key] = ep_info[key].unsqueeze(0)
                     infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
-                value = torch.mean(infotensor)
-                wandb_key = key if key.startswith('wococo/') else 'Episode_rew/' + key
+                value = torch.mean(infotensor).item()
+                # Categorize episode metrics for better TB organization
+                if key.startswith('wococo/'):
+                    wandb_key = key
+                elif key.startswith('term_'):
+                    wandb_key = f'Termination/{key}'
+                elif key == 'terrain_level' or key.startswith('terrain_level'):
+                    wandb_key = f'Curriculum/{key}'
+                elif key in ['stage_anneal_frac', 'dr_scale_mean', 'dr_scale_max', 'dr_ramp_armed']:
+                    wandb_key = f'Curriculum/{key}'
+                elif key.startswith('rew_'):
+                    wandb_key = f'Reward/{key}'
+                else:
+                    wandb_key = f'Episode/{key}'
                 wandb_dict[wandb_key] = value
                 ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs['collection_time'] + locs['learn_time']))
 
-        # Was `['mean_value_loss']` -- a literal list, so wandb received a string and
-        # the critic's loss was never actually recorded on any run.
+        # === Loss metrics ===
         wandb_dict['Loss/value_function'] = locs['mean_value_loss']
-        # Critic health. A small value loss cannot be told apart from a flat one from
-        # the loss alone; the explained variance can (1 = perfect, 0 = no better than
-        # predicting the batch mean, < 0 = worse).
-        wandb_dict['Loss/value_explained_var'] = getattr(
-            self.alg, 'last_explained_var', float('nan'))
+        wandb_dict['Loss/value_explained_var'] = getattr(self.alg, 'last_explained_var', float('nan'))
         wandb_dict['Loss/surrogate'] = locs['mean_surrogate_loss']
         wandb_dict['Loss/estimator'] = locs['mean_estimator_loss']
-        wandb_dict['Loss/hist_latent_loss'] = locs['mean_hist_latent_loss']
         wandb_dict['Loss/priv_reg_loss'] = locs['mean_priv_reg_loss']
         wandb_dict['Loss/priv_ref_lambda'] = locs['priv_reg_coef']
         wandb_dict['Loss/entropy_coef'] = locs['entropy_coef']
         wandb_dict['Loss/learning_rate'] = self.alg.learning_rate
-        # KL-schedule diagnostics: the driver of the adaptive lr and how often it
-        # saturated at the floor this iteration. Without these the lr trace alone
-        # can't distinguish "KL on target" from "KL pinned way above target".
+        # KL-schedule diagnostics
         wandb_dict['Loss/kl_mean'] = getattr(self.alg, 'last_kl_mean', float('nan'))
         wandb_dict['Loss/lr_floor_frac'] = getattr(self.alg, 'last_lr_floor_frac', float('nan'))
-        # Rollout/replay agreement of the camera latent, measured with the parameters
-        # untouched. It must sit at float noise (~1e-4): anything larger means the
-        # encoder is replayed on inputs it never saw during the rollout, so every PPO
-        # ratio is measured against a policy that never existed -- which the KL-adaptive
-        # schedule reads as "the step was too big" and drains the lr into its floor.
-        wandb_dict['Loss/kl_replay'] = getattr(self.alg, 'last_replay_kl', float('nan'))
-        # Depth PPO only: how closely the camera latent tracks the privileged scan
-        # latent it is anchored to. NaN on the other paths.
-        wandb_dict['Loss/depth_aux_scan'] = getattr(
-            self.alg, 'last_depth_aux_loss', float('nan'))
-        # Pre-clip gradient split between the two parameter groups that share ONE
-        # clip_grad_norm_: a dominant encoder starves the actor's update.
-        wandb_dict['Loss/grad_norm_policy'] = getattr(
-            self.alg, 'last_grad_norm_policy', float('nan'))
-        wandb_dict['Loss/grad_norm_depth'] = getattr(
-            self.alg, 'last_grad_norm_depth', float('nan'))
-        wandb_dict['Loss/encoder_lr'] = (
-            self.alg.learning_rate * self.alg.depth_encoder_lr_ratio
-            if getattr(self.alg, 'train_depth_ppo', False) else float('nan'))
-        wandb_dict['Loss/discriminator'] = locs['mean_disc_loss']
-        wandb_dict['Loss/discriminator_accuracy'] = locs['mean_disc_acc']
+        # Gradient norms
+        wandb_dict['Loss/grad_norm_policy'] = getattr(self.alg, 'last_grad_norm_policy', float('nan'))
+
+        # === Dual-encoder specific metrics ===
+        if getattr(self.alg, 'use_dual_encoder', False):
+            wandb_dict['DualEncoder/consistency_loss'] = getattr(self.alg, 'last_consistency_loss', float('nan'))
+            wandb_dict['DualEncoder/consistency_ema'] = getattr(self.alg, 'consistency_ema', float('nan'))
+            wandb_dict['DualEncoder/height_weight'] = getattr(self.alg.actor_critic.actor, 'height_weight', 1.0)
+            wandb_dict['DualEncoder/success_rate_ema'] = getattr(self.alg, 'success_rate_ema', 0.0)
 
         wandb_dict['Policy/mean_noise_std'] = mean_std.item()
-        # Rollout length per iteration. Task configs derive it differently
-        # (depth_encoder.num_steps_per_env = update_interval * 24 vs the runner's own
-        # 24), so "seconds per iteration" is NOT comparable across tasks unless this
-        # sits on the same chart.
-        wandb_dict['Perf/steps_per_iteration'] = self.num_steps_per_env
+        
+        # === Performance metrics ===
         wandb_dict['Perf/total_fps'] = fps
-        wandb_dict['Perf/collection time'] = locs['collection_time']
+        wandb_dict['Perf/collection_time'] = locs['collection_time']
         wandb_dict['Perf/learning_time'] = locs['learn_time']
+        
+        # === Training metrics ===
         if len(locs['rewbuffer']) > 0:
             wandb_dict['Train/mean_reward'] = statistics.mean(locs['rewbuffer'])
-            wandb_dict['Train/mean_reward_explr'] = statistics.mean(locs['rew_explr_buffer'])
-            wandb_dict['Train/mean_reward_task'] = wandb_dict['Train/mean_reward'] - wandb_dict['Train/mean_reward_explr']
-            wandb_dict['Train/mean_reward_entropy'] = statistics.mean(locs['rew_entropy_buffer'])
+            wandb_dict['Train/mean_reward_task'] = wandb_dict['Train/mean_reward'] - statistics.mean(locs['rew_explr_buffer'])
             wandb_dict['Train/mean_episode_length'] = statistics.mean(locs['lenbuffer'])
-            # wandb_dict['Train/mean_reward/time', statistics.mean(locs['rewbuffer']), self.tot_time)
-            # wandb_dict['Train/mean_episode_length/time', statistics.mean(locs['lenbuffer']), self.tot_time)
 
         wandb.log(wandb_dict, step=locs['it'])
+        
+        # Write to TensorBoard (critical for monitoring when --no_wandb is used)
+        if self.writer is not None:
+            for key, value in wandb_dict.items():
+                if isinstance(value, (int, float)) and not (isinstance(value, float) and (value != value)):  # skip NaN
+                    self.writer.add_scalar(key, value, locs['it'])
 
         str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "
 
@@ -753,15 +814,16 @@ class OnPolicyRunner:
         # Health line shared by every path: one glance says whether the lr schedule is
         # reacting to real policy change or to replay error, whether the critic is
         # actually fitting, and which parameter group is eating the clip budget.
-        log_string += (f"""{'lr (policy/encoder):':>{pad}} {self.alg.learning_rate:.2e}/"""
-                       f"""{wandb_dict['Loss/encoder_lr']:.2e}\n"""
-                       f"""{'KL (sched/replay):':>{pad}} {wandb_dict['Loss/kl_mean']:.4f}/"""
-                       f"""{wandb_dict['Loss/kl_replay']:.4f}\n"""
-                       f"""{'Value explained var:':>{pad}} {wandb_dict['Loss/value_explained_var']:.3f}\n"""
-                       f"""{'Grad norm (policy/depth):':>{pad}} {wandb_dict['Loss/grad_norm_policy']:.2f}/"""
-                       f"""{wandb_dict['Loss/grad_norm_depth']:.2f}\n"""
-                       f"""{'Depth aux scan loss:':>{pad}} {wandb_dict['Loss/depth_aux_scan']:.4f}\n"""
-                       f"""{'Steps per iteration:':>{pad}} {self.num_steps_per_env}\n""")
+        log_string += f"""{'lr (policy):':>{pad}} {self.alg.learning_rate:.2e}\n"""
+        log_string += f"""{'KL (sched):':>{pad}} {wandb_dict.get('Loss/kl_mean', float('nan')):.4f}\n"""
+        log_string += f"""{'Value explained var:':>{pad}} {wandb_dict.get('Loss/value_explained_var', float('nan')):.3f}\n"""
+        log_string += f"""{'Grad norm (policy):':>{pad}} {wandb_dict.get('Loss/grad_norm_policy', float('nan')):.2f}\n"""
+                
+        # Dual-encoder specific health metrics
+        if getattr(self.alg, 'use_dual_encoder', False):
+            log_string += f"""{'Dual encoder - consistency_ema:':>{pad}} {wandb_dict.get('DualEncoder/consistency_ema', float('nan')):.4f}\n"""
+            log_string += f"""{'Dual encoder - height_weight:':>{pad}} {wandb_dict.get('DualEncoder/height_weight', 1.0):.4f}\n"""
+        log_string += f"""{'Steps per iteration:':>{pad}} {self.num_steps_per_env}\n"""
         log_string += f"""{'-' * width}\n"""
         log_string += ep_string
         curr_it = locs['it'] - self.start_learning_iteration

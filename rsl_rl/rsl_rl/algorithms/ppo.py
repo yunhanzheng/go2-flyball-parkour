@@ -367,10 +367,12 @@ class PPO:
         self.storage.compute_returns(last_values, self.gamma, self.lam)
     
 
-    def update(self):
+    def update(self, info=None):
         # Accumulate the per-minibatch losses as DETACHED GPU scalars and sync to the
         # host ONCE after the update loop — was 4 .item() calls (each a CUDA sync) per
         # minibatch, i.e. 4 * num_learning_epochs * num_mini_batches syncs/iteration.
+        if info is None:
+            info = {}
         mean_value_loss = torch.zeros((), device=self.device)
         mean_surrogate_loss = torch.zeros((), device=self.device)
         mean_estimator_loss = torch.zeros((), device=self.device)
@@ -397,15 +399,20 @@ class PPO:
 
                 depth_aux_loss = None
                 if depth_batch is not None:
-                    # Depth PPO: rebuild the camera latent from the cached
-                    # (frame, hidden-before, proprio) triple and feed it as the scan
-                    # slot, so the distribution being clipped is the deployed one.
-                    # hist_encoding is always on here — the deploy path has no
-                    # privileged latent.
+                    # Rebuild the camera latent from the cached (frame, hidden-before, proprio) triple
                     depth_latent, depth_aux_loss = self._depth_latent_batch(
                         depth_batch, depth_hidden_batch, depth_prop_batch, obs_batch)
-                    self.actor_critic.act(self.depth_actor_obs(obs_batch), hist_encoding=True,
-                                          scandots_latent=depth_latent)
+                    
+                    if self.use_dual_encoder:
+                        # Dual encoder: actor sees BOTH height scan (via scan_encoder) AND depth latent
+                        # scandots_latent=None means "use the actor's own scan encoder"
+                        self.actor_critic.act(obs_batch, hist_encoding=True,
+                                              scandots_latent=None,  # Use height scan encoder internally
+                                              depth_latent=depth_latent)
+                    else:
+                        # Depth PPO: depth latent REPLACES scan latent
+                        self.actor_critic.act(self.depth_actor_obs(obs_batch), hist_encoding=True,
+                                              scandots_latent=depth_latent)
                 else:
                     self.actor_critic.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0]) # match distribution dimension
 
@@ -506,6 +513,8 @@ class PPO:
                     consistency_loss = torch.nn.functional.mse_loss(height_latent, depth_latent)
                     loss = loss + self.consistency_loss_weight * consistency_loss
                     
+                    # Save raw consistency loss for logging
+                    self.last_consistency_loss = consistency_loss.item()
                     # Update EMA for adaptive decay
                     self.consistency_ema = self.ema_alpha * self.consistency_ema + (1 - self.ema_alpha) * consistency_loss.item()
                     
@@ -682,12 +691,14 @@ class PPO:
         if not self.use_dual_encoder:
             return
         
-        # Extract metrics from info dict
-        success_rate = info.get('success_rate', 0.0)
+        # No finished episodes is missing data, not a 0% success observation.
+        # Keep the EMA unchanged until a reset batch supplies a real rate.
+        if 'success_rate' in info:
+            success_rate = info['success_rate']
+            self.success_rate_ema = (
+                self.ema_alpha * self.success_rate_ema
+                + (1 - self.ema_alpha) * success_rate)
         mean_level = info.get('mean_level', 0.0)
-        
-        # Update success rate EMA
-        self.success_rate_ema = self.ema_alpha * self.success_rate_ema + (1 - self.ema_alpha) * success_rate
         
         # Check triple conditions
         can_decay = (

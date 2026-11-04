@@ -106,6 +106,7 @@ TERM_CODE_NAMES = {
     10: "wococo_stage1_ground",
     11: "wococo_stage2_overshoot",
     12: "behind_wall",
+    13: "low_velocity",
 }
 
 
@@ -1748,6 +1749,9 @@ def play(args):
                 code = int(env.last_term_code[eid].item())
                 _last_term_text[eid] = (f"{TERM_CODE_NAMES.get(code, 'unknown')} "
                                         f"(code {code}, step {i})")
+                # Print termination reason when recording video
+                if video_writer is not None:
+                    print(f"[play] Episode ended: env {eid} -> {_last_term_text[eid]}")
         if _need_viewer:
             web_viewer.last_term_reason = _last_term_text[env.lookat_id]
 
