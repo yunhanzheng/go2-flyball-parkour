@@ -161,7 +161,9 @@ class TaskRegistry():
             print(train_cfg.runner.load_run)
             # load_root = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', "rough_a1", train_cfg.runner.load_run)
             resume_path = get_load_path(log_root, load_run=train_cfg.runner.load_run, checkpoint=train_cfg.runner.checkpoint)
-            runner.load(resume_path)
+            if getattr(args, "no_resume_optimizer", False):
+                print("[train] --no_resume_optimizer: keeping a freshly initialised Adam optimizer")
+            runner.load(resume_path, load_optimizer=not getattr(args, "no_resume_optimizer", False))
             if not train_cfg.policy.continue_from_last_std:
                 runner.alg.actor_critic.reset_std(train_cfg.policy.init_noise_std, 12, device=runner.device)
 

@@ -481,6 +481,16 @@ class Go2TeacherCfg( Go2RoughCfg ):
         # scale * gain * dt * 1.0 * n_persist = 0.25 * 1.5 * 0.02 * 1.0 * 15 = 0.1125,
         # so +0.15 fits it. Re-derive if the gain or n_persist changes.
         wococo_income_episode_cap = 3.15
+        # E10 (teacher-from-flat-v4-2000 post-mortem): the warm-started policy
+        # collapsed into 'press the wall, stay alive, wait for timeout' -- timeout
+        # costs 0 and only falls pay termination=-150, so waiting dominates
+        # attempting the plant. 11815 iters, s0_hold_ok_frac ~0.001, zero
+        # curriculum promotions. Dwell termination makes stalling expensive:
+        # once armed (committed to the wall) the stage must advance within
+        # 200 steps (4 s) or the episode is hard-terminated (-150).
+        # OFF again for the scratch line: a cold policy needs an unpenalized
+        # exploration window around the wall; re-enable if the stall equilibrium
+        # reappears (it was verified to fire correctly, term_plant_dwell ~0.5).
         enable_plant_dwell_termination = False
         wococo_plant_dwell_max_steps   = 200
         wococo_n_persist = 5   # anti-tap: hold the foothold N steps to bank
@@ -560,7 +570,7 @@ class Go2TeacherCfgPPO( Go2RoughCfgPPO ):
         num_depth_latent = 32
     
     class runner( Go2RoughCfgPPO.runner ):
-        save_interval = 1000  # Save checkpoint every 1000 iterations
+        save_interval = 500  # denser than 1000: early cold-start behavior moves fast, keep rollback picks cheap
     
     class algorithm( Go2RoughCfgPPO.algorithm ):
         # Dual-encoder consistency loss configuration
