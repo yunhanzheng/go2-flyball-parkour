@@ -127,6 +127,14 @@ class OnPolicyRunner:
                 f"actor={actor_dual}. Set policy.use_dual_encoder to match algorithm.")
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
+        # Checkpoint ladder: main hardcoded 1x below 2500, 2x below 5000, 5x after,
+        # which at save_interval=1000 means 5000 iterations (~6.5 h) between saves.
+        # That is exactly the window an OOM kill costs, so make the ladder config
+        # driven. A one-checkpoint budget is 112 MB, so the cadence also has to
+        # respect the disk. The default below reproduces main's behaviour exactly.
+        self.save_throttle = tuple(
+            (int(start_it), int(mult)) for start_it, mult in
+            self.cfg.get("save_throttle") or ((0, 1), (2500, 2), (5000, 5)))
         self.dagger_update_freq = self.alg_cfg["dagger_update_freq"]
 
         self.alg.init_storage(
@@ -337,15 +345,12 @@ class OnPolicyRunner:
             learn_time = stop - start
             if self.log_dir is not None:
                 self.log(locals())
-            if it < 2500:
-                if it % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
-            elif it < 5000:
-                if it % (2*self.save_interval) == 0:
-                    self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
-            else:
-                if it % (5*self.save_interval) == 0:
-                    self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+            cur_mult = 1
+            for start_it, mult in self.save_throttle:
+                if it >= start_it:
+                    cur_mult = mult
+            if it % (cur_mult * self.save_interval) == 0:
+                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
             ep_infos.clear()
         
         # self.current_learning_iteration += num_learning_iterations
@@ -483,15 +488,12 @@ class OnPolicyRunner:
             learn_time = stop - start
             if self.log_dir is not None:
                 self.log(locals())
-            if it < 2500:
-                if it % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
-            elif it < 5000:
-                if it % (2*self.save_interval) == 0:
-                    self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
-            else:
-                if it % (5*self.save_interval) == 0:
-                    self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+            cur_mult = 1
+            for start_it, mult in self.save_throttle:
+                if it >= start_it:
+                    cur_mult = mult
+            if it % (cur_mult * self.save_interval) == 0:
+                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
             ep_infos.clear()
 
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))

@@ -41,12 +41,23 @@ class Go2StudentCfg(Go2TeacherCfg):
         # Rows 0-3 are off-distribution for DAgger (the teacher resamples into
         # [4, 9]). Demotion stays on within the band.
         min_terrain_level = 4
+        # The teacher now cold-starts at row 0 and ramps its DR monotonically from
+        # there; the student must not inherit either (its floor is 4), so pin main's
+        # starting state back here.
+        max_init_terrain_level = 5
 
     class rewards(Go2TeacherCfg.rewards):
         hurdle_clearance_start_armed = True   # teacher arms at iter 4000 of ITS run
 
     class domain_rand(Go2TeacherCfg.domain_rand):
         action_delay_latch_step = 0   # deploy enforces the delay unconditionally
+        # The teacher opts out of train.py's distillation guard (it only senses with
+        # the camera), but the student IS a distillation target, so re-arm the guard
+        # here: --use_camera must still come with --delay.
+        action_delay_distillation_guard = True
+        # The teacher latches its DR ceiling at the running max; the distillation
+        # student keeps main's behaviour (ceiling = current fleet mean level).
+        dr_ramp_monotonic = False
 
     class depth(Go2TeacherCfg.depth):
         # Exact physical-camera ray cast for the deployment-mirror experiment.
@@ -125,6 +136,12 @@ class Go2StudentCfgPPO(Go2TeacherCfgPPO):
 
     class runner(Go2TeacherCfgPPO.runner):
         save_interval = 1000
+        # The teacher's 200000-iteration budget belongs to its slow cold-start
+        # curriculum; the distilled student keeps main's 10000.
+        max_iterations = 10000
+        # ...and main's denser checkpoint ladder: the teacher's 2x tail is an OOM
+        # mitigation for a long run, pointless on a 10000-iteration student.
+        save_throttle = ((0, 1), (2500, 2), (5000, 5))
 
     class depth_encoder(Go2TeacherCfgPPO.depth_encoder):
         # DAgger action-noise injection, OFF. When > 0 it is applied to the EXECUTED

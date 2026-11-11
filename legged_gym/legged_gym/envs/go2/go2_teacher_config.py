@@ -65,15 +65,27 @@ class Go2TeacherCfg( Go2RoughCfg ):
         next_goal_threshold       = 0.2
         terminate_on_lateral_deviation = True
         lateral_deviation_term_m       = 1.5
-        terminate_on_yaw_tracking = False  # TEMP: disabled for video diagnosis
-        # Low-velocity termination: stop episode if robot stalls in front of obstacle.
-        terminate_on_low_velocity = True
-        low_velocity_term_mps = 0.1  # m/s threshold
-        low_velocity_term_duration_steps = 50  # 2s @ 25Hz control frequency
-        # Start pose randomization: fixed range (no terrain-level scaling)
-        randomize_start_pos = True   # ±0.3m xy jitter
-        randomize_start_yaw = True   # fixed yaw range
-        rand_yaw_range = 0.3         # max ±17° at all levels
+        # Must stay False to reproduce main's teacher. In main the teacher runs
+        # WITHOUT a camera, and legged_robot.check_termination gates this cutoff on
+        # `cfg.depth.use_camera`, so main's teacher effectively never terminated on
+        # yaw error. The dual-encoder teacher DOES take a camera, which would arm
+        # this cutoff and silently add an episode-end main never had. (The distil
+        # tasks set False for the same reason.)
+        terminate_on_yaw_tracking = False
+        # No stall termination and no behind-the-wall termination: main's teacher
+        # has neither. terminate_on_low_velocity is opt-in and defaults to False in
+        # the code, so it is simply left unset. terminate_behind_wall defaults to
+        # True in the SHARED base config (it was added for later flyball work), so it
+        # has to be pinned off here to keep the teacher's episode ends identical to
+        # main's -- otherwise walking around the plate would end the episode early.
+        terminate_behind_wall = False
+        # Start-pose randomization stays OFF to match main's teacher run: main never
+        # jittered spawn xy/yaw, so the warm-start must see the same reset
+        # distribution. rand_yaw_range keeps main's value (inert while
+        # randomize_start_yaw is False).
+        randomize_start_pos = False
+        randomize_start_yaw = False
+        rand_yaw_range = 1.2
 
     class commands( Go2RoughCfg.commands ):
         # Per episode: STANDSTILL (random 0-4 s) -> RUN -> HARD STOP.
@@ -122,37 +134,121 @@ class Go2TeacherCfg( Go2RoughCfg ):
         randomize_motor            = True
         motor_strength_range       = [0.8, 1.2]
 
-        # Per-env random action latency: each episode samples U[0,2] steps (0-40ms).
-        # Deploy-faithful: the real Go2 has ~20ms comms lag, so training with random
-        # latency teaches the policy to handle variable delay robustly.
-        randomize_action_latency   = True
-        action_latency_range       = [0, 2]        # 0, 20, or 40ms per env per episode
+        # Fixed-delay model: no per-env action/proprio latency DR. Pinned to main's
+        # teacher run so the dual-encoder branch differs only in the actor input.
+        randomize_action_latency   = False
+        action_latency_range       = [0, 2]        # inert while the flag above is False
         randomize_proprio_latency  = False
-        action_delay               = False         # superseded by randomize_action_latency
-        action_delay_latch_mean_level = None
+        action_delay               = True
+        action_delay_latch_mean_level = 6.0
         action_delay_latch_step       = None
         action_delay_ramp_steps       = 0
+        # This task is a TEACHER whose camera is a live perception sensor, not a
+        # stand-in for the height scan. train.py's distillation guard would otherwise
+        # force --delay and latch the 1-step (20 ms) delay at step 0, arming it ~6
+        # terrain levels earlier than main's teacher. Opting out keeps main's actual
+        # behaviour: 0-delay episodes until the fleet mean level first reaches 6.0.
+        # Students/distillation configs leave this at the default (True).
+        action_delay_distillation_guard = False
         randomize_contact_threshold = False
 
-        # Full DR from step 0, no curriculum ramp. dr_lock_to_terrain_level=False
-        # means every env always runs at dr_scale=1.0 regardless of terrain level.
-        # Action latency is independently random per episode (randomize_action_latency),
-        # so coupling it to terrain level would be double-dipping.
-        dr_scale_range             = [1.0, 1.0]
-        dr_lock_to_terrain_level   = False
+        # Fleet-mean DR ramp: the ceiling reaches full DR at mean level 6, and each
+        # reset samples a per-env scale below it. Resumes are pre-armed by helpers.py.
+        dr_scale_range             = [0.0, 1.0]
+        dr_lock_to_terrain_level   = True
         dr_ramp_use_mean_level     = True
-        dr_scale_sample_per_env    = False
-        dr_ramp_full_at_mean_level = None      # disabled — no ramp
-        dr_ramp_arm_below_mean_level = 0.0     # inert when dr_lock_to_terrain_level=False
+        # main's per-env draw is kept: each reset samples U[s_lo, ceiling] per env, so
+        # the fleet still sees a real spread of DR strength. Only the CEILING below is
+        # made sticky -- the draw itself is untouched.
+        dr_scale_sample_per_env    = True
+        # The single deliberate deviation from main: the ceiling is latched at its
+        # running max instead of being re-read from the current mean level. Otherwise a
+        # curriculum demotion drags the randomisation down with it, and the low terrain
+        # rows would never again expose the policy to the high-DR regime it already
+        # unlocked -- each env would only meet high DR on the rows it happens to climb.
+        dr_ramp_monotonic          = True
+        dr_ramp_full_at_mean_level = 6.0
+        dr_ramp_arm_below_mean_level = 0.5
         dr_ramp_start_armed        = False
 
     class depth(Go2RoughCfg.depth):
+        # The dual-encoder teacher is the DEPTH-CONSUMING policy, so its image chain
+        # is copied verbatim from main's Go2StudentCfg.depth -- main's teacher never
+        # takes a camera, so the student is the only deployment-faithful reference.
+        # Verified key-by-key: this block now resolves to exactly the same 64 depth
+        # keys as main's student (the one exception is hole_fill_backend, see below).
+
+        # Exact physical-camera ray cast. 480x270 is the D435 resolution, and it is
+        # what makes the PW-hole / edge-corruption lengths below physically mean
+        # anything: pw_hole_scale is in RAW pixels, so filling a 106x60 frame with a
+        # 32-pixel blob would smear ~5 cm instead of the intended ~6 mm.
+        original = (480, 270)
+
+        # Deploy pads exposure->latent to a hard 80 ms. In 20 ms capture frames:
+        # floor 4 = that constant, cap 5 = tick phase + measured late tail.
+        latency_range = [4, 5]
+        # Real deployment always has this 80-100 ms transport latency. Do not
+        # let the depth-noise curriculum create artificially fresh observations.
+        latency_scale_with_noise = False
+
+        # The 50 Hz capture grid (capture_interval = 1, inherited) exists ONLY to
+        # give the lag 20 ms resolution: the encoder runs at 10 Hz, so 4 of every
+        # 5 frames an env renders are never shown to a network. Cast per-env on
+        # demand instead -- identical frames and lag, ~5x fewer rays at 480x270.
+        render_on_demand = True
+        empty_below_m = 0.15   # sub-15 cm readings become far/invalid
+
+        # Only the low-rate, large PW hole process remains enabled below.
+        noise_scale_per_env = True
+        noise_scale_min = 0.0
+        noise_scale_init_random = True
+
+        # Real D435 sees its own legs. Changes the depth distribution, so a policy
+        # trained without it cannot be resumed from, only re-distilled.
+        self_geometry = True
+        self_geometry_links = None
+
+        # Geometric camera artifacts are disabled; only PW holes remain.
+        stereo_shadow = True
+        stereo_baseline = 0.010
+        pw_blindspot_cols = 0     # superseded by the geometric band
+
+        # All other stochastic depth terms are disabled. Edge corruption runs on the
+        # full 480x270 Warp frame: 10 cm gradient threshold, half the flagged pixels,
+        # no dilation so artifacts stay on the actual silhouette edge.
+        pw_edge_thresh = 0.10
+        pw_edge_prob   = 1.00
+        pw_edge_dilate = 0
+        dis_noise      = 0.0
+        noise_gaussian = 0.0
+        noise_dropout  = 0.0
+        pw_hole_prob   = 0.007
+        # PW runs before resize; ~64 raw pixels = the old ~8 policy pixels, preserving large organic blobs.
+        pw_hole_scale  = 32
+        pw_hole_smooth_sigma = 1.5  # rounded organic blob footprints
+        pw_hole_drift = 0.50       # move across the full frame, still coherent
+        pw_empty_min  = 0.0
+        pw_blur_sigma = 0.0
+
+        # Same deployment-compatible RealSense fill after the PW holes.
+        hole_fill = True
+        hole_fill_iters = 8
+        # Same algorithm as main's student (which only had the numpy/cv2 path), but
+        # as max/min pools: bit-identical output (tests/test_hole_fill_backend.py),
+        # 0.3 ms vs 481 ms per control step at 480x270 x 280 envs. The cv2 path is
+        # unusable at this resolution, and this branch's own student config already
+        # uses "gpu" for the same reason.
+        hole_fill_backend = "gpu"
+        hole_fill_upscale = False
+        hole_fill_width = 480
+        hole_fill_height = 270
+
         # Keep the training terrain mix (100% flywall_box) during camera replay.
         # The default True rewrites to a multi-terrain mix for student distillation,
-        # but for evaluation we want the same terrain the teacher trained on.
+        # but here we want the same terrain the teacher trained on.
         override_terrain_mix_for_camera = False
         # Also keep the same terrain grid (horizontal_scale, num_cols) so the
-        # wall position matches the height-scan replay exactly.
+        # wall position matches the height-scan layout exactly.
         override_terrain_grid_for_camera = False
 
     class noise(Go2RoughCfg.noise):
@@ -182,29 +278,6 @@ class Go2TeacherCfg( Go2RoughCfg ):
         curriculum  = True
         no_demotion = False   # the demote band below needs demotion on
         num_cols    = 80
-        # Re-deal the terrain COLUMN to an env every time its curriculum row actually moves.
-        # Columns are difficulty-neutral here: terrain.py:500 derives difficulty from the row only, and with a
-        # single-entry mix the column-dependent `choice` (terrain.py:504) cannot switch terrain type either.
-        # What a column DOES carry is the layout re-roll -- inter-hurdle gap uniform(1.5,2.8) m, which also shifts
-        # the wall standoff by the same +-0.65 m -- wall tilt +-5 deg, hurdle height jitter, ground roughness.
-        # Paired with the round-robin i % num_cols initial mapping (legged_gym/envs/base/legged_robot.py), this
-        # lifts the depth-BC subset (cfg.depth.num_depth_envs rows, always envs 0..nd-1 because the partial-fleet
-        # capture masks the rest) off its 4 fixed layouts: blocked columns + no resample meant envs 0..279 saw
-        # cols 0..3 for their entire lives, while the teacher's scan covers all 80.
-        # Requires the column resample in _update_terrain_curriculum; off (absent) = upstream per-life pinning.
-        resample_type_on_level_change = True
-
-        # Curriculum mastery: require N consecutive successes before promoting (prevents one-lucky-episode promotion).
-        # success = max_goal_idx_ep >= promote_threshold (70% of goals). Failure resets streak to 0.
-        promote_streak = 1
-
-        # Demotion mastery: require N consecutive failures before demoting (prevents one-bad-episode demotion).
-        # failure = max_goal_idx_ep < demote_threshold (30% of goals). Success resets streak to 0.
-        demote_streak = 1
-
-        # Anti-forgetting: fraction of envs that randomly sample level in [0, max_level_seen] at each reset.
-        # Keeps 80% on the curriculum frontier, 20% exploring the full range to prevent catastrophic forgetting.
-        random_level_frac = 0.2
 
         horizontal_scale        = 0.01   # 1 cm cells represent the thickness curriculum
         terrain_length          = 10.0
@@ -229,9 +302,9 @@ class Go2TeacherCfg( Go2RoughCfg ):
         # lerp cannot reintroduce sub-minimum bars.
         flyball_hurdle_height_decorrelate   = True
         flyball_hurdle_zero_prob            = 0.25
-        # Hurdle count distribution (Row 4-9): 25% zero / 25% single / 50% double.
-        # zero_prob=0.25 → 25% tiles have 0 hurdles. Among remaining 75%: single_prob=0.333 → 25% have 1 hurdle, 50% have 2.
-        flyball_single_hurdle_prob          = 0.333
+        # Hurdle count: main teacher has no single-hurdle slot, i.e. every non-empty
+        # tile carries TWO bars. flyball_single_hurdle_prob is left at its code
+        # default (0.0) so the tile distribution matches main exactly.
         flyball_hurdle_height_jitter_m      = 0.0
         flyball_single_hurdle_thickness      = 0.01
         flyball_single_hurdle_thickness_range = None
@@ -244,8 +317,9 @@ class Go2TeacherCfg( Go2RoughCfg ):
         flyball_hurdle_clear_half_span         = 0.10
         flyball_hurdle_clear_box_height        = 0.17
         flyball_hurdle_roughness_height       = (0.0, 0.01)
-        # Distance jitter scales with difficulty: False = all rows get full [1.30, 1.90] m range (prevents memorizing 1.60 m at row 0).
-        flyball_hurdle_jitter_scale_with_difficulty = False
+        # Distance jitter scales with difficulty (main): True = low rows get a narrower
+        # range; False would give every row the full [1.30, 1.90] m range.
+        flyball_hurdle_jitter_scale_with_difficulty = True
 
         flyball_spawn_x                       = 1.0
         flyball_hurdle_front_from_spawn       = 1.60
@@ -295,7 +369,10 @@ class Go2TeacherCfg( Go2RoughCfg ):
         flyball_wall_goal_idx   = 1
         flyball_return_goal_idx = 2
 
-        max_init_terrain_level = 0   # E09: all envs start at level 0, curriculum climbs from there
+        # Cold curriculum start: every env begins on row 0 and has to earn its way up.
+        # main's teacher starts spread over [0, 5]; starting at 0 is what makes the DR
+        # ramp (which reads the fleet mean level) genuinely begin from zero.
+        max_init_terrain_level = 0
         resample_at_max_level  = True
         resample_min_level     = 4
         # [swimmer] Goal curriculum re-anchored to the 4-waypoint circuit. max_goal_idx
@@ -332,6 +409,10 @@ class Go2TeacherCfg( Go2RoughCfg ):
         hurdle_clearance_arm_mean_level       = 0.0
         hurdle_clearance_ramp_delay_steps     = 0
         hurdle_clearance_ramp_steps           = 4000 * 24
+        # Left at main's value on purpose: this term's alpha rides a fixed iteration
+        # budget (arm_step / ramp_steps), not the terrain curriculum, so it keeps the
+        # per-env Bernoulli(p=alpha) draw. Only the curriculum-driven DR below went
+        # fleet-wide.
         hurdle_clearance_per_env_draw        = True
         hurdle_pair_sym_sigma_rad             = 0.40   # summed mirror error per pair
 
@@ -452,21 +533,13 @@ class Go2TeacherCfg( Go2RoughCfg ):
         wococo_stage2_overshoot_margin_m     = 0.45
         wococo_stage1_ground_max_z           = 0.05
 
-        # DISABLED: this was the second biggest destabiliser of new-run. It fired on
-        # the SAME iteration as the 20 ms action-delay latch (both keyed to fleet
-        # mean level 6.0) and, with ramp_steps = 0, deleted roll/pitch/base_contact
-        # termination in ONE step. Measured 5120 -> 5150: mean reward +0.03 -> -48.57,
-        # term_timeout 0.12 -> 0.42, ep_length 676 -> 682 and then 944 by iter 5500,
-        # s1_hold_ok 0.303 -> 0.026 -> 0.000. The robot fell and then lay still for the
-        # rest of the 20 s episode: 0 recoveries in the following 4500 iterations.
-        # It cannot buy get-up ability -- no reward term pays for self-righting, and
-        # wococo_armed stays latched after a fall, so re-accelerating for another
-        # plant earns no tracking income. Attitude/contact terminations therefore
-        # stay ACTIVE at every level (0-9). The banked wall plant does not need them:
-        # roll_term_deg = 95 already admits the -wall_angle lean, and the 0-6 levels
-        # were learned with zero slack (term_base_contact 0.13-0.22 throughout).
-        # Parameters below are kept so the mechanism can be re-enabled for an A/B run.
-        enable_wococo_armed_term_exempt      = False
+        # Pinned ON to match main's teacher, which never exempted the attitude /
+        # contact terminations. Kept as a knob only: t18 set it False and measured
+        # what the exemption costs once armed -- with ramp_steps = 0 it deleted
+        # roll/pitch/base_contact termination in ONE step (mean reward +0.03 ->
+        # -48.57, term_timeout 0.12 -> 0.42, s1_hold_ok 0.303 -> 0.000), and no
+        # reward term pays for self-righting, so the robot fell and lay still.
+        enable_wococo_armed_term_exempt      = True
         wococo_armed_term_exempt_min_mean_level = 6.0
         wococo_armed_term_exempt_ramp_steps  = 0
         wococo_armed_roll_term_max_deg       = None
@@ -525,7 +598,6 @@ class Go2TeacherCfg( Go2RoughCfg ):
 
             tracking_goal_vel = 1.5   # combined tracking budget 2.0
             tracking_yaw      = 0.5
-            lin_vel_y         = -1.0  # penalize lateral drift to walk straighter
             standstill_orientation = 0.5
             feet_contact_forces = -0.01
 
@@ -570,7 +642,19 @@ class Go2TeacherCfgPPO( Go2RoughCfgPPO ):
         num_depth_latent = 32
     
     class runner( Go2RoughCfgPPO.runner ):
-        save_interval = 500  # denser than 1000: early cold-start behavior moves fast, keep rollback picks cheap
+        save_interval = 1000
+        # main's ladder (1x -> 2x at 2500 -> 5x at 5000) leaves 5000 iterations
+        # (~6.5 h here) between checkpoints, and this shared container has already
+        # OOM-killed the process once, so that window is the worst-case loss. Keep
+        # 1000 up to 5000 and then stay at 2000 iterations (~2.6 h) instead of 5x.
+        # 200 checkpoints would also not fit: 112 MB each, disk has ~37 GB free, so
+        # 2x means ~100 files (~11 GB) over the full 200000-iteration budget.
+        save_throttle = ((0, 1), (5000, 2))
+        # The terrain curriculum only starts to climb once the fleet has consumed
+        # roughly 6144-env-equivalent x 12000 iterations of experience; at 512 envs
+        # main's 10000 would end the run before the first promotion. 200000 leaves
+        # enough headroom to walk the DR ramp (full at mean level 6) too.
+        max_iterations = 200000
     
     class algorithm( Go2RoughCfgPPO.algorithm ):
         # Dual-encoder consistency loss configuration

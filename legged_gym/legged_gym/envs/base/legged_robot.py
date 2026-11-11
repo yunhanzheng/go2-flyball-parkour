@@ -1348,6 +1348,13 @@ class LeggedRobot(BaseTask):
                 else:
                     full_at = float(getattr(self.cfg.domain_rand, "dr_ramp_full_at_mean_level", self.max_terrain_level - 1))
                     alpha = (mean_level / max(full_at, 1e-6)).clamp(0., 1.)
+                    if getattr(self.cfg.domain_rand, "dr_ramp_monotonic", False):
+                        # Sticky fleet progress: hold the maximum ever reached, so a
+                        # curriculum demotion cannot walk the DR ceiling (or the sensor
+                        # lag riding it) back down. Off by default = main's behaviour,
+                        # where the ceiling tracks the CURRENT mean level.
+                        self._dr_alpha_latched = max(self._dr_alpha_latched, float(alpha))
+                        alpha = torch.tensor(self._dr_alpha_latched, device=self.device)
                     ceiling = s_lo + (s_hi - s_lo) * alpha
                     # Sensor latency tracks the fleet ceiling, exempt from the per-env draw below; alpha is already normalized 0..1 progress.
                     self._dr_fleet_latency_ramp = float(alpha)
@@ -1461,7 +1468,7 @@ class LeggedRobot(BaseTask):
         latency_ramp = None
         if getattr(self.cfg.domain_rand, "dr_lock_to_terrain_level", False):
             if self._dr_fleet_latency_ramp is not None:
-                # Fleet-ceiling ramp: identical for every env, so the per-env dr_scale_sample_per_env draw does not halve the trained latency mean -- transport lag is a pipeline property shared by all units. Dynamics/noise/push DR keep the per-env draw on purpose.
+                # Fleet-ceiling ramp: identical for every env, so the per-env dr_scale_sample_per_env draw does not halve the trained latency mean -- transport lag is a pipeline property shared by all units.
                 latency_ramp = torch.full((len(env_ids),), self._dr_fleet_latency_ramp,
                                           device=self.device)
             else:
@@ -2091,7 +2098,12 @@ class LeggedRobot(BaseTask):
         """
         self.up_axis_idx = 2 # 2 for z, 1 for y -> adapt gravity accordingly
         # Isaac Gym camera sensors need a graphics/Vulkan context, which segfaults on headless compute nodes (exit 139); the Warp renderer raycasts on CUDA with no graphics context, so force one only for the Isaac Gym camera path.
-        if self.cfg.depth.use_camera and not self._warp_enabled():
+        # cfg.env.offscreen_render (set by play.py for --video/--web) needs a graphics
+        # context too: the Warp depth backend raycasts on CUDA, but the Isaac Gym camera
+        # sensor that records the mp4 still rasterises through Vulkan. Without this the
+        # sensor handles come back invalid and get_camera_image() segfaults.
+        if ((self.cfg.depth.use_camera and not self._warp_enabled())
+                or getattr(self.cfg.env, "offscreen_render", False)):
             self.graphics_device_id = self.sim_device_id  # required in headless mode
         self.sim = self.gym.create_sim(self.sim_device_id, self.graphics_device_id, self.physics_engine, self.sim_params)
         mesh_type = self.cfg.terrain.mesh_type
@@ -2905,7 +2917,9 @@ class LeggedRobot(BaseTask):
         # Per-env DR strength multiplier (1.0 = full), driven by terrain level in reset_idx when domain_rand.dr_lock_to_terrain_level is enabled.
         self.dr_scale = torch.ones(self.num_envs, device=self.device, dtype=torch.float)
         # Normalized (0..1) FLEET-level DR progress, i.e. dr_scale's ceiling mapped back onto [0, 1]. Sensor latency (proprio + depth) rides this rather than the per-env dr_scale because transport lag is identical on every unit, and per-env U[0, ceiling] sampling would dilute the trained mean to half the configured range.
-        # Dynamics/noise/push DR deliberately KEEP the per-env draw. None => no fleet ramp available; latency falls back to per-env dr_scale.
+        # Dynamics/noise/push DR instead follow dr_scale: per-env U[s_lo, ceiling] unless domain_rand.dr_scale_sample_per_env is False, in which case they get the bare ceiling. None => no fleet ramp available; latency falls back to per-env dr_scale.
+        # Sticky fleet DR progress (0..1); only advances when dr_ramp_monotonic is on.
+        self._dr_alpha_latched = 0.0
         self._dr_fleet_latency_ramp = None
         # Warm starts may pre-arm the fleet-level DR ramp.
         self.dr_ramp_armed = bool(getattr(self.cfg.domain_rand, "dr_ramp_start_armed", False))
