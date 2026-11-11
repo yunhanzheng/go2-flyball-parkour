@@ -20,6 +20,14 @@ legged_gym/logs/extreme-parkour/*
 !legged_gym/logs/extreme-parkour/teacher/
 !legged_gym/logs/extreme-parkour/student/
 !legged_gym/logs/extreme-parkour/flat_baseline/
+# Warm-start anchors for the dual-encoder turn, file by file: the run directories
+# also hold event files, env_cfg dumps and videos that must stay out.
+!legged_gym/logs/extreme-parkour/dualenc-flat-512/
+legged_gym/logs/extreme-parkour/dualenc-flat-512/*
+!legged_gym/logs/extreme-parkour/dualenc-flat-512/model_3600.pt
+!legged_gym/logs/extreme-parkour/dualenc-wall-warm3600-480p/
+legged_gym/logs/extreme-parkour/dualenc-wall-warm3600-480p/*
+!legged_gym/logs/extreme-parkour/dualenc-wall-warm3600-480p/model_5000.pt
 wandb/
 
 # Temporary / scratch

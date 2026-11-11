@@ -1,0 +1,6 @@
+# GitHub rejects any single file above 100 MB, and these two warm-start
+# checkpoints are 112 MB each, so they go through Git LFS. The older released
+# checkpoints (teacher / student / flat_baseline) are small enough to stay as
+# regular blobs, so this is scoped to the two files rather than a broad *.pt rule.
+legged_gym/logs/extreme-parkour/dualenc-flat-512/model_3600.pt filter=lfs diff=lfs merge=lfs -text
+legged_gym/logs/extreme-parkour/dualenc-wall-warm3600-480p/model_5000.pt filter=lfs diff=lfs merge=lfs -text
