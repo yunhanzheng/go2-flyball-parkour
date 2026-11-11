@@ -1391,8 +1391,11 @@ def play(args):
 
     video_writer = None
     video_cam = None
-    VIDEO_W, VIDEO_H = 1920, 1080
-    VIDEO_CAM_W, VIDEO_CAM_H = 1920, 1080
+    # Overridable for hosts without a usable Vulkan device (llvmpipe): 1080p
+    # software rasterisation is both very slow and prone to crashing.
+    VIDEO_W = int(os.environ.get('PLAY_VIDEO_W', 1920))
+    VIDEO_H = int(os.environ.get('PLAY_VIDEO_H', 1080))
+    VIDEO_CAM_W, VIDEO_CAM_H = VIDEO_W, VIDEO_H
     # Render every VIDEO_STEP_DECIM-th step; writer fps is divided to match.
     VIDEO_STEP_DECIM = 2
     if args.video:

@@ -266,8 +266,10 @@ class WebViewer:
     def attach_view_camera(self, i, env_handle, actor_handle, root_pos):
         if True:
             camera_props = gymapi.CameraProperties()
-            camera_props.width = 1920
-            camera_props.height = 1080
+            # Overridable for hosts without a usable Vulkan device (llvmpipe): 1080p
+            # software rasterisation is both very slow and prone to crashing.
+            camera_props.width = int(os.environ.get('PLAY_VIDEO_W', 1920))
+            camera_props.height = int(os.environ.get('PLAY_VIDEO_H', 1080))
             # 1x, not 2x: 2x renders 3840x2160 (4x shaded pixels/frame), which on the
             # 1 cm cliffside trimesh dominates wall-clock and dies in the x264 encode.
             camera_props.supersampling_horizontal = 1
@@ -1089,10 +1091,14 @@ class WebViewer:
 
         # Without the reward dashboard the camera fills the screen — bump the font.
         big = not self.show_rew
-        font_scale = 1.1 if big else 0.55
-        thickness = 2 if big else 1
-        line_h    = 44 if big else 22
-        y0 = 40 if big else 20
+        # The pixel sizes below are tuned for 1080p; scale with the frame width so a
+        # low-resolution capture (PLAY_VIDEO_W) does not get an overlay that swallows
+        # the robot.
+        _s = img.shape[1] / 1920.0
+        font_scale = (1.1 if big else 0.55) * _s
+        thickness  = max(1, int(round((2 if big else 1) * _s)))
+        line_h     = max(8, int(round((44 if big else 22) * _s)))
+        y0         = max(10, int(round((40 if big else 20) * _s)))
         for line in lines:
             cv2.putText(img, line, (10, y0),
                         cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
@@ -1103,8 +1109,8 @@ class WebViewer:
         if wococo_armed is not None:
             badge = 'WoCoCo: ARMED' if wococo_armed else 'WoCoCo: disarmed'
             badge_color = (0, 255, 80) if wococo_armed else (150, 150, 150)
-            badge_scale = 1.1
-            badge_th = 2
+            badge_scale = 1.1 * (img.shape[1] / 1920.0)
+            badge_th = max(1, int(round(2 * (img.shape[1] / 1920.0))))
             (bw, bh), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, badge_scale, badge_th)
             bx = max(10, img.shape[1] - bw - 12)
             by = max(bh + 10, img.shape[0] - 16)

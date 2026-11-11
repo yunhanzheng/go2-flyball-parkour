@@ -173,13 +173,20 @@ def train(args):
     # Distillation guard: a student must NEVER train on undelayed actions — deploy
     # runs the enforced 16 ms proprio pad (~= the 1-step delay), so require --delay
     # to latch it from step 0 (helpers.py sets action_delay_start_latched).
+    # A TEACHER that uses the camera as a live sensor (dual-encoder) is not a student:
+    # it keeps main's terrain-level latch via domain_rand.action_delay_distillation_guard
+    # = False, so the delay still engages, just at the same point main's teacher does.
     if (args.use_camera and not args.delay
+            and getattr(env_cfg.domain_rand, "action_delay_distillation_guard", True)
             and getattr(env_cfg.domain_rand, "action_delay_latch_mean_level", None) is not None):
         raise SystemExit(
             "[train] ERROR: distillation (--use_camera) on a config with "
             "action_delay_latch_mean_level requires --delay, so the student "
             "trains on the 1-step (20 ms) action delay from the first batch "
-            "(matches the 16 ms proprio pad enforced on hardware).")
+            "(matches the 16 ms proprio pad enforced on hardware). If this task is a "
+            "TEACHER that merely senses with the camera, set "
+            "domain_rand.action_delay_distillation_guard = False to keep main's "
+            "terrain-level latch instead.")
     env_cfg.terrain.log_dir = log_pth
     env_cfg.terrain.save_vts = args.save_vts
     if args.save_vts_full_res:
