@@ -46,6 +46,34 @@ class RolloutStorage:
             self.action_mean = None
             self.action_sigma = None
             self.hidden_states = None
+            # Depth-RL only: frozen depth-encoder latent the action was sampled
+            # from. Left None by the DAgger (learn_vision) and privileged PPO
+            # (learn_RL) paths, which never populate it.
+            self.depth_latent = None
+            # Depth-RL only: the GROUND-TRUTH privileged state slice. learn_depth_rl
+            # overwrites that slice of the acting observation with the estimator's
+            # output, so the estimator's supervised target has to ride along here
+            # (env.cfg.env.num_privileged_obs is None, so privileged_observations is
+            # empty and cannot carry it).
+            self.priv_states_true = None
+            # Depth-RL only: the encoder's INPUTS for this step, kept so
+            # update_depth_rl can re-run the encoder inside the PPO graph (the
+            # rollout latent itself is detached and carries no gradient).
+            # depth_hidden_in is the GRU state the step started from, so the
+            # replay is a truncated BPTT(1) — the same truncation the rollout
+            # applies between iterations.
+            self.depth_images = None
+            self.depth_props = None
+            self.depth_hiddens = None
+            # Depth-RL only: the TEACHER's frozen scan-encoder latent for the same
+            # step (actor.infer_scandots_latent on the privileged observation) -- the
+            # teacher's counterpart of depth_latent, reused here as an ANCHOR during
+            # the PPO update. Without it the depth encoder is optimised ONLY through
+            # the policy surrogate, has no stable target, and drifts enough inside a
+            # single iteration (encoder grad norm ~9) that the replayed latent stops
+            # matching the rollout latent. That drift is then charged to the
+            # trust-region KL, which pins the actor lr to its floor.
+            self.scandots_latent = None
         def clear(self):
             self.__init__()
 
@@ -76,6 +104,15 @@ class RolloutStorage:
         self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
 
+        # Depth-RL only (allocated lazily on the first transition that carries
+        # one, so the other two learning paths never pay for it).
+        self.depth_latents = None
+        self.priv_states_true = None
+        self.depth_images = None
+        self.depth_props = None
+        self.depth_hiddens = None
+        self.scandots_latents = None
+
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
 
@@ -97,6 +134,46 @@ class RolloutStorage:
         self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
         self.mu[self.step].copy_(transition.action_mean)
         self.sigma[self.step].copy_(transition.action_sigma)
+        if transition.depth_latent is not None:
+            if self.depth_latents is None:
+                self.depth_latents = torch.zeros(
+                    self.num_transitions_per_env, self.num_envs,
+                    *transition.depth_latent.shape[1:], device=self.device)
+            self.depth_latents[self.step].copy_(transition.depth_latent)
+        if transition.priv_states_true is not None:
+            if self.priv_states_true is None:
+                self.priv_states_true = torch.zeros(
+                    self.num_transitions_per_env, self.num_envs,
+                    *transition.priv_states_true.shape[1:], device=self.device)
+            self.priv_states_true[self.step].copy_(transition.priv_states_true)
+        # Encoder replay inputs. depth_images/depth_hiddens are stored in fp16
+        # (24 steps x num_envs x 58x87 / 512 is ~273 MB at 1024 envs) and cast
+        # back to fp32 in the generator; fp16 -> fp32 is exact.
+        if transition.depth_images is not None:
+            if self.depth_images is None:
+                self.depth_images = torch.zeros(
+                    self.num_transitions_per_env, self.num_envs,
+                    *transition.depth_images.shape[1:], device=self.device,
+                    dtype=torch.float16)
+                self.depth_props = torch.zeros(
+                    self.num_transitions_per_env, self.num_envs,
+                    *transition.depth_props.shape[1:], device=self.device)
+                self.depth_hiddens = torch.zeros(
+                    self.num_transitions_per_env, self.num_envs,
+                    *transition.depth_hiddens.shape[1:], device=self.device,
+                    dtype=torch.float16)
+            self.depth_images[self.step].copy_(transition.depth_images)
+            self.depth_props[self.step].copy_(transition.depth_props)
+            self.depth_hiddens[self.step].copy_(transition.depth_hiddens)
+        # Teacher-anchor target for the encoder replay (see the Transition field).
+        # Same hold-last cadence as depth_latent, so the pair the anchor compares
+        # was produced from the SAME frame.
+        if transition.scandots_latent is not None:
+            if self.scandots_latents is None:
+                self.scandots_latents = torch.zeros(
+                    self.num_transitions_per_env, self.num_envs,
+                    *transition.scandots_latent.shape[1:], device=self.device)
+            self.scandots_latents[self.step].copy_(transition.scandots_latent)
 
         self._save_hidden_states(transition.hidden_states)
         self.step += 1
@@ -191,6 +268,77 @@ class RolloutStorage:
                 
                 yield obs_batch, critic_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, \
                        old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None
+
+    def depth_mini_batch_generator(self, num_mini_batches, num_epochs=8):
+        """Minibatches for the depth-RL update (learn_depth_rl).
+
+        Same shuffling/flattening as mini_batch_generator, but additionally yields
+        the per-step depth-encoder INPUTS (frame, proprio, GRU hidden-in). The
+        update replays `depth_encoder.forward_step` on them, so the PPO policy
+        gradient reaches the encoder -- i.e. the encoder is optimised jointly
+        with depth_actor, the way the teacher's scan_encoder is. Storing the
+        encoder inputs (58x87 fp16 + 512 fp16 per step) costs ~273 MB at 1024
+        envs x 24 steps, versus ~12.7 GB for the 480x270 frames.
+        """
+        if self.depth_latents is None:
+            raise AssertionError(
+                "depth_latents is empty: depth_mini_batch_generator is only "
+                "valid on the depth-RL path, which stores a latent per step.")
+        batch_size = self.num_envs * self.num_transitions_per_env
+        mini_batch_size = batch_size // num_mini_batches
+        indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
+
+        observations = self.observations.flatten(0, 1)
+        depth_latents = self.depth_latents.flatten(0, 1)
+        if self.privileged_observations is not None:
+            critic_observations = self.privileged_observations.flatten(0, 1)
+        else:
+            critic_observations = observations
+
+        if self.priv_states_true is None:
+            raise AssertionError(
+                "priv_states_true is empty: the depth-RL update trains the estimator, "
+                "so act_depth must store the ground-truth privileged state slice.")
+        priv_states_true = self.priv_states_true.flatten(0, 1)
+
+        if self.depth_images is None:
+            raise AssertionError(
+                "depth_images is empty: the depth-RL update replays the encoder "
+                "inside the PPO graph, so act_depth must store its inputs.")
+        depth_images = self.depth_images.flatten(0, 1)
+        depth_props = self.depth_props.flatten(0, 1)
+        depth_hiddens = self.depth_hiddens.flatten(0, 1)
+        if self.scandots_latents is None:
+            raise AssertionError(
+                "scandots_latents is empty: the depth-RL update anchors the encoder "
+                "on the teacher's scan latent, so act_depth must store it.")
+        scandots_latents = self.scandots_latents.flatten(0, 1)
+
+        actions = self.actions.flatten(0, 1)
+        values = self.values.flatten(0, 1)
+        returns = self.returns.flatten(0, 1)
+        old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
+        advantages = self.advantages.flatten(0, 1)
+        old_mu = self.mu.flatten(0, 1)
+        old_sigma = self.sigma.flatten(0, 1)
+
+        for epoch in range(num_epochs):
+            for i in range(num_mini_batches):
+                start = i * mini_batch_size
+                end = (i + 1) * mini_batch_size
+                batch_idx = indices[start:end]
+
+                yield (observations[batch_idx], depth_latents[batch_idx], critic_observations[batch_idx],
+                       actions[batch_idx], values[batch_idx], advantages[batch_idx], returns[batch_idx],
+                       old_actions_log_prob[batch_idx], old_mu[batch_idx], old_sigma[batch_idx],
+                       priv_states_true[batch_idx],
+                       # Teacher anchor target: NOT detached here, the update detaches
+                       # it so it can never be pulled toward the learner.
+                       scandots_latents[batch_idx],
+                       depth_images[batch_idx].float(), depth_props[batch_idx],
+                       # (batch, 512) -> (1, batch, 512): the GRU is batch_first and
+                       # takes one timestep, so the leading axis is the sequence.
+                       depth_hiddens[batch_idx].float().unsqueeze(0))
 
     # for RNNs only
     def reccurent_mini_batch_generator(self, num_mini_batches, num_epochs=8):

@@ -30,6 +30,7 @@
 
 from legged_gym import LEGGED_GYM_ROOT_DIR, envs
 from time import time
+from time import perf_counter
 from warnings import WarningMessage
 import math
 import numpy as np
@@ -78,6 +79,46 @@ def euler_from_quaternion(quat_angle):
      
         return roll_x, pitch_y, yaw_z # in radians
 
+class _StageProfiler:
+    """Opt-in per-stage wall-clock timing for one env step (EP_DEPTH_PROFILE=<n>).
+
+    Entering a stage closes the previous one, so a straight line of calls in the
+    step path yields the stage breakdown without nesting bookkeeping. Every
+    boundary synchronises the GPU: accurate, but it perturbs throughput and adds
+    a sync per stage, so it is a no-op unless the env var is set, and it disables
+    itself after <n> depth batches.
+    """
+
+    def __init__(self):
+        self.left = int(os.environ.get("EP_DEPTH_PROFILE", "0"))
+        self.acc = {}
+        self._t0 = None
+        self._open = None
+
+    def enter(self, name):
+        if self.left <= 0:
+            return
+        if self._open is not None:
+            torch.cuda.synchronize()
+            dt = perf_counter() - self._t0
+            self.acc[self._open] = self.acc.get(self._open, 0.0) + dt
+        torch.cuda.synchronize()
+        self._t0 = perf_counter()
+        self._open = name
+
+    def flush(self, tag="step"):
+        if self.left <= 0:
+            return
+        self.enter("_")            # close the last open stage
+        self._open = None
+        tot = sum(self.acc.values())
+        parts = "  ".join(f"{k}={v * 1000:.1f}ms"
+                         for k, v in sorted(self.acc.items(), key=lambda kv: -kv[1]))
+        print(f"[prof:{tag}] #{self.left} step={tot * 1000:.1f}ms | {parts}", flush=True)
+        self.acc = {}
+        self.left -= 1
+
+
 class LeggedRobot(BaseTask):
     def __init__(self, cfg: LeggedRobotCfg, sim_params, physics_engine, sim_device, headless):
         """ Parses the provided config file,
@@ -94,9 +135,14 @@ class LeggedRobot(BaseTask):
         """
         self.cfg = cfg
         self.sim_params = sim_params
+        self.headless_flag = headless
         self.height_samples = None
         self.debug_viz = True
         self.init_done = False
+        # EP_DEPTH_PROFILE=<n>: print a per-stage breakdown of the next n depth
+        # batches. No-op (one branch per stage) when the env var is unset.
+        self.prof = _StageProfiler()
+        self._prof_batch = False
         self._parse_cfg(self.cfg)
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
 
@@ -167,24 +213,31 @@ class LeggedRobot(BaseTask):
         self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
         self.render()
 
+        self.prof.enter("physics")
         for _ in range(self.cfg.control.decimation):
             self.torques = self._compute_torques(self.actions).view(self.torques.shape)
             self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
             self.gym.simulate(self.sim)
             self.gym.fetch_results(self.sim, True)
             self.gym.refresh_dof_state_tensor(self.sim)
+        self.prof.enter("post_physics")
         self.post_physics_step()
+        self.prof.enter("obs_clip")
 
         clip_obs = self.cfg.normalization.clip_observations
         self.obs_buf = torch.clip(self.obs_buf, -clip_obs, clip_obs)
         if self.privileged_obs_buf is not None:
             self.privileged_obs_buf = torch.clip(self.privileged_obs_buf, -clip_obs, clip_obs)
         self.extras["delta_yaw_ok"] = self.delta_yaw < 0.6
+        self.prof.enter("get_depth_obs")
         if self.cfg.depth.use_camera and self.global_counter % self.cfg.depth.update_interval == 0:
             # Latency-aware selection (per-env depth_latency) so the sampled camera latency takes effect on every rollout step.
             self.extras["depth"] = self.get_depth_obs()
         else:
             self.extras["depth"] = None
+        if self._prof_batch:
+            self._prof_batch = False
+            self.prof.flush()
         return self.obs_buf, self.privileged_obs_buf, self.rew_buf, self.reset_buf, self.extras
 
     def get_history_observations(self):
@@ -195,7 +248,7 @@ class LeggedRobot(BaseTask):
         depth_image = (depth_image - self.cfg.depth.near_clip) / (self.cfg.depth.far_clip - self.cfg.depth.near_clip)  - 0.5
         return depth_image
     
-    def _depth_noise_factors(self, n=None, env_id=None):
+    def _depth_noise_factors(self, n=None, env_id=None, rows=None):
         """The per-env depth-degradation factors derived from depth_noise_scale s.
 
         ONE linear knob drives every camera degradation:
@@ -226,7 +279,12 @@ class LeggedRobot(BaseTask):
         if env_id is not None:
             s = float(self.depth_noise_scale[env_id])
             return 2.0 * s, min(max(2.0 * s, 0.0), 1.0)
-        s = self.depth_noise_scale[:n].view(-1, 1, 1)
+        if rows is not None:
+            # Sub-batch post-process (process_depth_batch(rows=...)): the factors
+            # must follow the ENVS, not the first n rows of the fleet.
+            s = self.depth_noise_scale.index_select(0, rows).view(-1, 1, 1)
+        else:
+            s = self.depth_noise_scale[:n].view(-1, 1, 1)
         return 2.0 * s, torch.clamp(2.0 * s, 0.0, 1.0)
 
     def _depth_phys_factor_1d(self):
@@ -240,6 +298,8 @@ class LeggedRobot(BaseTask):
         # MGDP-style depth noise (arclab-hku/MGDP) on raw depth in metres (Isaac negative-in-front); [H, W] or [N, H, W]; no-op when the cfg knobs are 0.
         g = getattr(self.cfg.depth, "noise_gaussian", 0.0)
         p = getattr(self.cfg.depth, "noise_dropout", 0.0)
+        if g <= 0.0 and p <= 0.0:
+            return depth   # both knobs off -> nothing to inject (used to walk the tensor anyway)
         # Per-env rate factor scales artifact density/amplitude linearly, so artifacts stay hard at every scale (sparse-but-hard, never dense-but-faded) and vanish at s=0. None -> 1x base rates.
         rf = getattr(self, "_noise_rate_factor", None)
         if rf is None:
@@ -331,8 +391,53 @@ class LeggedRobot(BaseTask):
                               mode="bilinear", align_corners=False)
         return field.squeeze(1)
 
-    def _apply_pw_holes(self, depth):
-        """Apply the temporally-drifting organic hole mask at current resolution."""
+    def _pw_low_advance(self, n, H, W, dtype):
+        """Advance the shared drifting hole field by ONE control step for n envs.
+
+        Split out from _pw_hole_field so the temporal state can stay STEP-LOCKED
+        for the whole fleet while the [H,W] pixel field is only materialised for
+        the rows that actually produce a frame this step (see
+        process_depth_batch(rows=...)). Cost is n * (H//scale) * (W//scale) draws
+        (~123k for 1024 envs), i.e. negligible next to one full-frame pass.
+        """
+        scale = max(1, int(getattr(self.cfg.depth, "pw_hole_scale", 8)))
+        lh, lw = max(1, H // scale), max(1, W // scale)
+        drift = float(getattr(self.cfg.depth, "pw_hole_drift", 0.1))
+        new_low = torch.rand(n, 1, lh, lw, device=self.device, dtype=dtype)
+        if getattr(self, "_pw_low", None) is None or self._pw_low.shape != new_low.shape:
+            self._pw_low = new_low
+        else:
+            self._pw_low = (1.0 - drift) * self._pw_low + drift * new_low
+
+    def _pw_field_from_rows(self, rows, H, W, dtype, n=None):
+        """Upsample the ALREADY-advanced low-res hole field for `rows` only
+        (or for the first `n` envs when rows is None)."""
+        low = self._pw_low if rows is None else self._pw_low.index_select(0, rows)
+        if n is not None and low.shape[0] != n:
+            low = low[:n]
+        low = low.squeeze(1).to(dtype)
+        # Smooth the coarse field before upsampling so thresholded regions are blob-like rather than pointy, while keeping the slow drift.
+        smooth_sigma = float(getattr(self.cfg.depth, "pw_hole_smooth_sigma", 0.0))
+        if smooth_sigma > 0.0 and min(low.shape[-2:]) > 1:
+            # Reflective padding avoids hard zero borders and wraparound seams.
+            self._gaussian_blur_batch(low, smooth_sigma)  # refresh cached kernel
+            r = self._pw_blur_pad
+            low = F.conv2d(
+                F.pad(low.unsqueeze(1), (r, r, r, r), mode="reflect"),
+                self._pw_blur_kernel).squeeze(1)
+        field = F.interpolate(low.unsqueeze(1), size=(H, W),
+                              mode="bilinear", align_corners=False)
+        return field.squeeze(1)
+
+    def _apply_pw_holes(self, depth, rows=None, from_advanced=False):
+        """Apply the organic hole mask at current resolution.
+
+        `rows` (long index into the fleet) means the drift state was already
+        advanced for every env by process_depth_batch and only these rows need
+        their pixel field; `from_advanced` with rows=None uses the same shared
+        state for the first N envs. Neither => legacy batch-local behaviour that
+        owns (and advances) its own state, as process_depth_image expects.
+        """
         if not getattr(self.cfg.depth, "pw_noise", False):
             return depth
         hp = float(getattr(self.cfg.depth, "pw_hole_prob", 0.0))
@@ -340,7 +445,10 @@ class LeggedRobot(BaseTask):
             return depth
         N, H, W = depth.shape
         far = -float(self.cfg.depth.far_clip)
-        field = self._pw_hole_field(N, H, W, depth.device, depth.dtype)
+        if rows is not None or from_advanced:
+            field = self._pw_field_from_rows(rows, H, W, depth.dtype, n=N)
+        else:
+            field = self._pw_hole_field(N, H, W, depth.device, depth.dtype)
         hp_env = torch.clamp(hp * self._noise_rate_factor.view(-1), 0.0, 1.0) \
             if torch.is_tensor(getattr(self, "_noise_rate_factor", None)) \
             else hp
@@ -358,7 +466,20 @@ class LeggedRobot(BaseTask):
             thr = torch.quantile(flat, 1.0 - hp, dim=1).view(N, 1, 1)
         return torch.where(field > thr, torch.full_like(depth, far), depth)
 
-    def _apply_parkour_wild_noise(self, depth):
+    def _bs_advance(self, n):
+        """Advance the blind-spot random walk for n envs by ONE control step.
+
+        Kept separate for the same reason as _pw_low_advance: the width state is
+        step-locked for the whole fleet even when only a sub-batch is materialised.
+        """
+        kmax = int(getattr(self.cfg.depth, "pw_blindspot_cols", 0))
+        if kmax <= 0 or not hasattr(self, "pw_bs_k"):
+            return
+        drift = float(getattr(self.cfg.depth, "pw_blindspot_drift", 0.05))
+        target = torch.rand(n, device=self.device) * kmax
+        self.pw_bs_k[:n] = (1.0 - drift) * self.pw_bs_k[:n] + drift * target
+
+    def _apply_parkour_wild_noise(self, depth, rows=None, advance_bs=True):
         """Parkour-in-the-Wild depth degradation (Rudin et al., arXiv 2505.11164).
 
         Operates on the cropped raw depth (metres, Isaac negative-in-front
@@ -428,12 +549,20 @@ class LeggedRobot(BaseTask):
         # The side is fixed per env (self.pw_bs_side); the width random-walks (pw_blindspot_drift) so the band is temporally stable rather than strobing, and self.pw_bs_slope leans it off-vertical.
         kmax = int(getattr(self.cfg.depth, "pw_blindspot_cols", 0))
         if kmax > 0 and hasattr(self, "pw_bs_k"):
-            drift = float(getattr(self.cfg.depth, "pw_blindspot_drift", 0.05))
-            target = torch.rand(N, device=depth.device) * kmax
-            self.pw_bs_k[:N] = (1.0 - drift) * self.pw_bs_k[:N] + drift * target
-            rows = torch.arange(H, device=depth.device, dtype=torch.float32)         # [H]
-            k_per_row = (self.pw_bs_k[:N, None]
-                         + self.pw_bs_slope[:N, None] * (rows[None, :] - H / 2.0))   # [N,H]
+            # The width state advances for the WHOLE fleet once per step; a
+            # sub-batch call (rows=...) only slices the already-advanced per-env
+            # width / slope / side instead of walking another [N,H,W] mask.
+            n_bs = int(self.num_envs) if rows is not None else N
+            if advance_bs:
+                self._bs_advance(n_bs)
+            bs_k = self.pw_bs_k if rows is None else self.pw_bs_k.index_select(0, rows)
+            bs_slope = (self.pw_bs_slope if rows is None
+                        else self.pw_bs_slope.index_select(0, rows))
+            bs_side = (self.pw_bs_side if rows is None
+                       else self.pw_bs_side.index_select(0, rows))
+            row_ids = torch.arange(H, device=depth.device, dtype=torch.float32)       # [H]
+            k_per_row = (bs_k[:, None]
+                         + bs_slope[:, None] * (row_ids[None, :] - H / 2.0))          # [N,H]
             # Per-row raggedness: the real invalid band's width jitters a pixel or two row-to-row and drops to zero in some rows.
             jrag = float(getattr(self.cfg.depth, "pw_blindspot_jitter", 0.0))
             if jrag > 0.0:
@@ -443,7 +572,7 @@ class LeggedRobot(BaseTask):
             col = torch.arange(W, device=depth.device, dtype=torch.float32)          # [W]
             left = col[None, None, :] < k_per_row[:, :, None]                         # [N,H,W]
             right = col[None, None, :] >= (W - k_per_row[:, :, None])
-            mask = torch.where(self.pw_bs_side[:N, None, None], right, left)          # [N,H,W]
+            mask = torch.where(bs_side[:, None, None], right, left)                   # [N,H,W]
             depth = torch.where(mask, torch.full_like(depth, far), depth)
 
         # (5) Gaussian blur, one shared kernel mixed in per-env by `phys`: s=0 keeps the render's edge sharpness, s>=0.5 the configured optical softness.
@@ -496,39 +625,70 @@ class LeggedRobot(BaseTask):
         return depth_image[:-2, 4:-4]
 
     def _apply_configured_hole_fill(self, depth):
-        """Apply deployment hole fill at the physical camera resolution."""
+        """Apply deployment hole fill at the physical camera resolution.
+
+        Batched GPU path by default. The legacy per-frame numpy/cv2 implementation
+        costs ~15 ms/frame, so a 1024-env capture batch took ~16 s and dominated
+        the whole training iteration (382 s/iter, 99.9% of it inside env.step);
+        it also grew linearly with num_envs, which is why 280->1024 envs showed no
+        throughput gain. hole_fill_batch() is bit-identical (see its docstring).
+        EP_HOLE_FILL_CPU=1 restores the frame loop for A/B checking.
+        """
         if not getattr(self.cfg.depth, "hole_fill", False):
             return depth
-        from legged_gym.utils.depth_hole_fill import hole_fill
-        positive = (-depth).detach().cpu().numpy()
-        invalid = positive >= float(self.cfg.depth.far_clip) - 1e-4
-        positive[invalid] = 0.0
+        from legged_gym.utils.depth_hole_fill import hole_fill, hole_fill_batch
+        far = float(self.cfg.depth.far_clip)
+        mode = int(getattr(self.cfg.depth, "hole_fill_mode", 1))
+        iters = int(getattr(self.cfg.depth, "hole_fill_iters", 8))
+        if os.environ.get("EP_HOLE_FILL_CPU", "0") == "1":
+            positive = (-depth).detach().cpu().numpy()
+            invalid = positive >= far - 1e-4
+            positive[invalid] = 0.0
+            if getattr(self.cfg.depth, "hole_fill_upscale", False):
+                fill_h = int(getattr(self.cfg.depth, "hole_fill_height", 270))
+                fill_w = int(getattr(self.cfg.depth, "hole_fill_width", 480))
+                # Deployment upsamples (nearest-neighbour) before the RealSense filter, so the one-pixel iteration radius is in physical-camera pixels.
+                if positive.shape[-2:] != (fill_h, fill_w):
+                    positive = F.interpolate(
+                        torch.from_numpy(positive).to(self.device).unsqueeze(1),
+                        size=(fill_h, fill_w), mode="nearest").squeeze(1).cpu().numpy()
+            filled = [hole_fill(frame, mode, iters) for frame in positive]
+            return -torch.from_numpy(np.stack(filled)).to(
+                device=depth.device, dtype=depth.dtype)
+        positive = -depth
+        positive = torch.where(positive >= far - 1e-4,
+                               torch.zeros_like(positive), positive)
         if getattr(self.cfg.depth, "hole_fill_upscale", False):
             fill_h = int(getattr(self.cfg.depth, "hole_fill_height", 270))
             fill_w = int(getattr(self.cfg.depth, "hole_fill_width", 480))
-            # Deployment upsamples (nearest-neighbour) before the RealSense filter, so the one-pixel iteration radius is in physical-camera pixels.
-            if positive.shape[-2:] != (fill_h, fill_w):
-                positive = F.interpolate(
-                    torch.from_numpy(positive).to(self.device).unsqueeze(1),
-                    size=(fill_h, fill_w), mode="nearest").squeeze(1).cpu().numpy()
-        filled = [
-            hole_fill(frame,
-                      int(getattr(self.cfg.depth, "hole_fill_mode", 1)),
-                      int(getattr(self.cfg.depth, "hole_fill_iters", 8)))
-            for frame in positive
-        ]
-        return -torch.from_numpy(np.stack(filled)).to(
-            device=depth.device, dtype=depth.dtype)
+            if tuple(positive.shape[-2:]) != (fill_h, fill_w):
+                positive = F.interpolate(positive.unsqueeze(1), size=(fill_h, fill_w),
+                                         mode="nearest").squeeze(1)
+        return -hole_fill_batch(positive, mode, iters)
 
-    def process_depth_batch(self, depth):
-        # Batched equivalent of process_depth_image for the Warp path; `depth` is [N, H, W] in the Isaac negative-in-front convention.
+    def process_depth_batch(self, depth, rows=None):
+        """Batched equivalent of process_depth_image for the Warp path; `depth` is
+        [N, H, W] in the Isaac negative-in-front convention.
+
+        `rows` (long index into the fleet) means `depth` already holds ONLY those
+        envs: the [H,W] pixel passes then run on the sub-batch, while the per-env
+        TEMPORAL state (drifting hole field, blind-spot random walk) is still
+        advanced once for the WHOLE fleet so the drift cadence stays step-locked.
+        """
         no_noise = os.environ.get("EP_NO_CAMERA_NOISE", "0") == "1"
         far, near = self.cfg.depth.far_clip, self.cfg.depth.near_clip
+        # Temporal degradation state: ONE advance per control step for every env,
+        # independent of how many rows get materialised below.
+        n_state = self.num_envs if rows is not None else depth.shape[0]
+        if getattr(self.cfg.depth, "pw_noise", False):
+            if float(getattr(self.cfg.depth, "pw_hole_prob", 0.0)) > 0.0:
+                self._pw_low_advance(n_state, depth.shape[1], depth.shape[2], depth.dtype)
+        self._bs_advance(n_state)
         # Noise-scale semantics -- ONE LINEAR KNOB (see _depth_noise_factors):
         #   rate = 2s scales every stochastic amplitude and artifact density (0 at s=0, reality-calibrated at s=0.5, 2x at s=1),
         #   phys = min(2s, 1) scales physical sensor properties (min range, blind-spot width, blur; at render time also stereo shadow, own-body geometry, transport latency).
         # Nothing is pixel-blended: the old scheme faded artifacts toward mid-gray below s=0.5, which the real sensor never does. Now s=0 IS the raw ideal ray-cast.
-        rate, phys = self._depth_noise_factors(depth.shape[0])
+        rate, phys = self._depth_noise_factors(depth.shape[0], rows=rows)
         _dbg_id = getattr(self, "_depth_debug_env_id", None)
         if _dbg_id is not None and 0 <= int(_dbg_id) < depth.shape[0]:
             _dbg_id = int(_dbg_id)
@@ -536,16 +696,21 @@ class LeggedRobot(BaseTask):
                 "01_raw_warp": depth[_dbg_id].detach().clone()
             }
         if not no_noise:
+            self.prof.enter("d:noise")
             self._noise_rate_factor = rate
             self._noise_phys_factor = phys
-            depth = depth + self.cfg.depth.dis_noise * rate \
-                * 2 * (torch.rand(depth.shape[0], 1, 1, device=self.device) - 0.5)
+            dis = float(getattr(self.cfg.depth, "dis_noise", 0.0))
+            if dis > 0.0:
+                depth = depth + dis * rate \
+                    * 2 * (torch.rand(depth.shape[0], 1, 1, device=self.device) - 0.5)
             depth = torch.clip(depth, -far, -near)
-            depth = self._apply_parkour_wild_noise(depth)
+            depth = self._apply_parkour_wild_noise(depth, rows=rows, advance_bs=False)
             depth = self._apply_depth_noise(depth)
-            depth = self._apply_pw_holes(depth)
+            self.prof.enter("d:pw_holes")
+            depth = self._apply_pw_holes(depth, rows=rows, from_advanced=True)
             if _dbg_id is not None:
                 self._depth_debug_stages["02_noisy_pre_fill"] = depth[_dbg_id].detach().clone()
+            self.prof.enter("d:hole_fill")
             depth = self._apply_configured_hole_fill(depth)
             if _dbg_id is not None:
                 self._depth_debug_stages["03_hole_filled"] = depth[_dbg_id].detach().clone()
@@ -553,7 +718,9 @@ class LeggedRobot(BaseTask):
             self._noise_phys_factor = None
         else:
             depth = torch.clip(depth, -far, -near)
+            self.prof.enter("d:hole_fill")
             depth = self._apply_configured_hole_fill(depth)
+        self.prof.enter("d:tail")
         empty_below = float(getattr(self.cfg.depth, "empty_below_m", 0.0))
         if empty_below > 0.0:
             depth = torch.where(depth > -(empty_below * phys),
@@ -607,8 +774,11 @@ class LeggedRobot(BaseTask):
         if self.global_counter % capture_interval != 0:
             return
 
+        self._prof_batch = True
+        self.prof.enter("depth:render")
         if self._depth_on_demand():
             self._update_depth_buffer_on_demand()
+            self.prof.enter("depth:post")
             return
 
         if self._warp_enabled():
@@ -620,6 +790,7 @@ class LeggedRobot(BaseTask):
                 body_quat=self.rigid_body_states[..., 3:7],
                 shadow_keep=self._depth_phys_factor_1d(),
                 self_on=getattr(self, "depth_self_geom_on", None))  # [N, H, W]
+            self.prof.enter("depth:post")
             new_frame = self.process_depth_batch(depth)  # [N, resized_h, resized_w]
             self.depth_buffer = torch.cat([self.depth_buffer[:, 1:], new_frame.unsqueeze(1)], dim=1)
             init_flag = self.episode_length_buf <= 1
@@ -668,22 +839,31 @@ class LeggedRobot(BaseTask):
             shadow_keep=self._depth_phys_factor_1d(),
             self_on=getattr(self, "depth_self_geom_on", None),
             active=active)                      # only these rows are valid
-        # The post-process runs on the FULL batch on purpose: the degradation carries per-env temporal state (blind-spot random walk, drifting hole field) that must advance once per call.
-        # Rows of envs that were not cast are computed and dropped; the rays are the cost.
-        new_frame = self.process_depth_batch(depth)
-        # Masked writes, not index lists: avoids a per-step nonzero()/host sync in the rollout hot loop.
+        # Post-process ONLY the rows that were cast. The rest are dropped by the
+        # masked write below, so materialising their frames was pure waste -- at
+        # 1024 envs the four full-resolution passes (noise / PW holes / hole fill /
+        # tail) measured ~120 ms per step, and 4 of every 5 steps produce nothing
+        # anybody reads. One index list per step costs a single small host sync
+        # (O(N) ids), far less than the ~90 ms of pixel work it removes. The per-env
+        # temporal degradation state still advances for the WHOLE fleet inside
+        # process_depth_batch, so the drift cadence is unchanged.
+        rows = active.nonzero(as_tuple=False).squeeze(1)
+        if rows.numel() == 0:
+            return
+        new_frame = self.process_depth_batch(depth.index_select(0, rows), rows=rows)
         n_slots = self.depth_buffer.shape[1]
-        roll = active.view(-1, 1, 1)
-        for s in range(n_slots - 1):            # shift older slots down one
-            self.depth_buffer[:, s] = torch.where(roll, self.depth_buffer[:, s + 1],
-                                                  self.depth_buffer[:, s])
-        self.depth_buffer[:, -1] = torch.where(roll, new_frame, self.depth_buffer[:, -1])
+        for s in range(n_slots - 1):            # shift older slots down one (active rows only)
+            self.depth_buffer[:, s].index_copy_(
+                0, rows, self.depth_buffer.index_select(0, rows).select(1, s + 1))
+        self.depth_buffer[:, -1].index_copy_(0, rows, new_frame)
         if n_slots > 1:
             # Fresh episodes: every slot holds the new frame, so no pre-reset frame can be served.
-            init = fresh.view(-1, 1, 1)
-            for s in range(n_slots - 1):
-                self.depth_buffer[:, s] = torch.where(init, new_frame,
-                                                      self.depth_buffer[:, s])
+            frows = fresh.nonzero(as_tuple=False).squeeze(1)
+            if frows.numel() > 0:
+                # active (hence rows) already contains every fresh row and is sorted.
+                sub_fresh = new_frame.index_select(0, torch.searchsorted(rows, frows))
+                for s in range(n_slots - 1):
+                    self.depth_buffer[:, s].index_copy_(0, frows, sub_fresh)
 
     def get_depth_obs(self):
         """The depth frame the policy/encoder consumes, with per-env camera
@@ -816,7 +996,12 @@ class LeggedRobot(BaseTask):
             self.last_contacts_obs = contact_obs
         else:
             self.contact_filt_obs = self.contact_filt
-        
+        # Knee-contact episode trackers (telemetry only; feeds contact/knee_* at reset).
+        if self.knee_body_indices.numel() > 0:
+            knee_force = torch.norm(self.contact_forces[:, self.knee_body_indices, :], dim=-1)
+            self.knee_contact_steps_ep += (knee_force > self._knee_contact_thresh).any(dim=1).long()
+            self.knee_max_force_ep = torch.maximum(self.knee_max_force_ep, knee_force.max(dim=1).values)
+
         self._update_goals()
         self._post_physics_step_callback()
         self._update_soft_curriculum_latches()
@@ -862,7 +1047,7 @@ class LeggedRobot(BaseTask):
         def _mean_level():
             nonlocal mean_level
             if mean_level is None:
-                mean_level = float(self.terrain_levels.float().mean())
+                mean_level = float(self.fleet_mean_level())
             return mean_level
 
         term_enabled = bool(getattr(
@@ -1030,7 +1215,7 @@ class LeggedRobot(BaseTask):
         # Curriculum latch: hold both terminations off until the fleet-average terrain level first reaches the arm threshold; once armed it stays armed.
         if not self.wococo_plant_fail_term_armed:
             arm_level = float(getattr(self.cfg.rewards, 'wococo_plant_fail_term_arm_mean_level', 4.0))
-            if self.terrain_levels.float().mean() >= arm_level:
+            if float(self.fleet_mean_level()) >= arm_level:
                 self.wococo_plant_fail_term_armed = True
                 self.wococo_plant_fail_arm_step = self.common_step_counter
         # Optional ramp on the arming, which is otherwise a STEP that hands every env two instant-death conditions at once. Measured cost of that step (E02): term_stage1_ground 0.000 -> 0.377 within ~40 updates and fleet level 3.95 -> 3.16.
@@ -1186,7 +1371,7 @@ class LeggedRobot(BaseTask):
         _latch_at = getattr(self.cfg.domain_rand, "action_delay_latch_mean_level", None)
         if (not self.action_delay_latched and self.cfg.domain_rand.action_delay
                 and (_latch_step is not None or _latch_at is not None)):
-            _mean_level = self.terrain_levels.float().mean()
+            _mean_level = self.fleet_mean_level()
             if _latch_step is not None:
                 _fire = evaluation_mode or self.common_step_counter >= int(_latch_step)
                 _why = f"step {self.common_step_counter} >= {int(_latch_step)}"
@@ -1215,7 +1400,7 @@ class LeggedRobot(BaseTask):
         if getattr(self.cfg.domain_rand, "dr_lock_to_terrain_level", False):
             s_lo, s_hi = self.cfg.domain_rand.dr_scale_range
             if getattr(self.cfg.domain_rand, "dr_ramp_use_mean_level", False):
-                mean_level = self.terrain_levels.float().mean()
+                mean_level = self.fleet_mean_level()
                 # Ignore the initial level spread until a cold fleet first demotes.
                 if not self.dr_ramp_armed and mean_level < float(getattr(self.cfg.domain_rand, "dr_ramp_arm_below_mean_level", 0.5)):
                     self.dr_ramp_armed = True
@@ -1226,15 +1411,27 @@ class LeggedRobot(BaseTask):
                 else:
                     full_at = float(getattr(self.cfg.domain_rand, "dr_ramp_full_at_mean_level", self.max_terrain_level - 1))
                     alpha = (mean_level / max(full_at, 1e-6)).clamp(0., 1.)
+                    # Monotonic latch: DR progress only ever rises, so a mean-level dip (a demotion wave after a hard episode batch) no longer rolls DR back down.
+                    _mono = getattr(self.cfg.domain_rand, "dr_ramp_monotonic", False)
+                    if _mono:
+                        alpha = torch.clamp(alpha, min=self._dr_ramp_alpha_hi)
+                        self._dr_ramp_alpha_hi = float(alpha)
                     ceiling = s_lo + (s_hi - s_lo) * alpha
                     # Sensor latency tracks the fleet ceiling, exempt from the per-env draw below; alpha is already normalized 0..1 progress.
                     self._dr_fleet_latency_ramp = float(alpha)
                     if getattr(self.cfg.domain_rand, "dr_scale_sample_per_env", False):
                         self.dr_scale[env_ids] = s_lo + (ceiling - s_lo) * torch.rand(len(env_ids), device=self.device)
+                    elif _mono:
+                        # Monotonic mode is fleet-wide: envs resetting later must not keep a stale (smaller) scale, so write the whole fleet and keep every env identical.
+                        self.dr_scale[:] = ceiling
                     else:
                         self.dr_scale[env_ids] = ceiling
             else:
                 alpha = (self.terrain_levels[env_ids].float() / max(self.max_terrain_level - 1, 1)).clamp(0., 1.)
+                if getattr(self.cfg.domain_rand, "dr_ramp_monotonic", False):
+                    # Per-env monotonic latch: an env that demotes keeps the DR strength it has already been trained against.
+                    alpha = torch.maximum(alpha, self._dr_alpha_env[env_ids])
+                    self._dr_alpha_env[env_ids] = alpha
                 self.dr_scale[env_ids] = s_lo + (s_hi - s_lo) * alpha
 
             # Ramp the reset-time DR terms with the per-env dr_scale: PD-gain and motor-offset are re-rolled here so their deviation from nominal scales 0 (cold) -> full, and dr_scale=0 gives nominal gains / zero offset.
@@ -1378,6 +1575,10 @@ class LeggedRobot(BaseTask):
             self.pw_bs_k[env_ids] = torch.rand(n, device=self.device) * int(self.cfg.depth.pw_blindspot_cols)
         # Snapshot BEFORE the zeroing below -- this is the curriculum's own promote/demote criterion and the logging block needs the value the finished episode reached.
         max_goal_idx_pre_reset = self.max_goal_idx_ep[env_ids].clone()
+        knee_steps_pre_reset = self.knee_contact_steps_ep[env_ids].clone()
+        knee_force_pre_reset = self.knee_max_force_ep[env_ids].clone()
+        self.knee_contact_steps_ep[env_ids] = 0
+        self.knee_max_force_ep[env_ids] = 0.
         self.cur_goal_idx[env_ids] = 0
         self.max_goal_idx_ep[env_ids] = 0
         self.reach_goal_timer[env_ids] = 0
@@ -1477,6 +1678,46 @@ class LeggedRobot(BaseTask):
         self.standstill_hold_steps[env_ids]            = 0
 
         self.extras["episode"] = {}
+        # Per-difficulty (terrain row) telemetry. With the row-difficulty grid,
+        # terrain_level == difficulty == wall angle, so binning finished episodes
+        # by row gives per-level performance. Snapshot BEFORE the episode_sums /
+        # episode_length zeroing below. Empty rows emit NaN (runner aggregates
+        # with nanmean, writer skips NaN) so keys stay consistent across steps.
+        # Opt-in via terrain.log_per_level_metrics; other runs are unaffected.
+        if getattr(self.cfg.terrain, 'log_per_level_metrics', False):
+            _lvl = self.terrain_levels[env_ids]
+            _rew_tot = torch.stack(
+                [self.episode_sums[k][env_ids] for k in self.reward_scales]
+            ).sum(0) / self.max_episode_length_s
+            _ep_len = self.episode_length_buf[env_ids].float() * self.dt
+            _succ = (self.term_reach_goal[env_ids].float()
+                     if hasattr(self, 'term_reach_goal')
+                     else torch.zeros_like(_ep_len))
+            _goal = max_goal_idx_pre_reset.float()
+            _knee_hit = (knee_steps_pre_reset > 0).float()
+            _nan = torch.tensor(float('nan'), device=self.device)
+            for _L in range(int(self.cfg.terrain.num_rows)):
+                _m = (_lvl == _L)
+                _pfx = f"per_level/L{_L}/"
+                if _m.any():
+                    self.extras["episode"][_pfx + "success"]   = _succ[_m].mean()
+                    self.extras["episode"][_pfx + "goal_idx"]  = _goal[_m].mean()
+                    self.extras["episode"][_pfx + "rew_total"] = _rew_tot[_m].mean()
+                    self.extras["episode"][_pfx + "ep_len_s"]  = _ep_len[_m].mean()
+                    self.extras["episode"][_pfx + "knee_hit_frac"] = _knee_hit[_m].mean()
+                else:
+                    for _k in ("success", "goal_idx", "rew_total", "ep_len_s", "knee_hit_frac"):
+                        self.extras["episode"][_pfx + _k] = _nan
+        # Knee (thigh/calf) ground-contact telemetry over the just-finished
+        # episodes: hit_frac = share of episodes with any >thresh contact step,
+        # steps_frac = mean per-episode share of steps in knee contact,
+        # max_force_N = mean per-episode peak knee force. episode_length_buf is
+        # still pre-zeroing here, so it is the finished episode's step count.
+        _knee_steps = knee_steps_pre_reset.float()
+        _ep_steps = self.episode_length_buf[env_ids].float().clamp(min=1.0)
+        self.extras["episode"]["contact/knee_hit_frac"] = (_knee_steps > 0).float().mean()
+        self.extras["episode"]["contact/knee_steps_frac"] = (_knee_steps / _ep_steps).mean()
+        self.extras["episode"]["contact/knee_max_force_N"] = knee_force_pre_reset.mean()
         for key in self.episode_sums.keys():
             log_key = 'rew_' + key
             if key.startswith('wococo_'):
@@ -1487,6 +1728,11 @@ class LeggedRobot(BaseTask):
 
         if self.cfg.terrain.curriculum:
             self.extras["episode"]["terrain_level"] = torch.mean(self.terrain_levels.float())
+            if bool(getattr(self.cfg.terrain, "count_graduated_in_mean_level", False)):
+                # Effective level used by every gate (graduated envs pinned to the top row)
+                # and the graduated fraction, so the two curves explain each other in TB.
+                self.extras["episode"]["terrain_level_eff"] = self.fleet_mean_level()
+                self.extras["episode"]["graduated_frac"] = torch.mean(self.graduated_buf.float())
             if getattr(self.cfg.rewards,
                        'wococo_stage_anneal_start_mean_level', None) is not None:
                 self.extras["episode"]["stage_anneal_frac"] = torch.tensor(
@@ -2276,6 +2522,23 @@ class LeggedRobot(BaseTask):
         self.last_push_step[:] = self.common_step_counter
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
 
+    def fleet_mean_level(self):
+        """Fleet-mean terrain level used by every curriculum-level gate.
+
+        With cfg.terrain.count_graduated_in_mean_level (student only; OFF by default so the
+        teacher keeps main's raw mean), envs that have graduated -- promoted past the last
+        curriculum row and then re-sampled into [resample_min_level, num_rows-1] -- keep
+        counting as the TOP row. That re-sample is an anti-forgetting device, not a loss of
+        progress, so letting it drag the average down would un-ramp DR and un-arm every
+        level-gated schedule.
+        """
+        levels = self.terrain_levels.float()
+        graduated = getattr(self, "graduated_buf", None)
+        if graduated is not None and bool(getattr(
+                self.cfg.terrain, "count_graduated_in_mean_level", False)):
+            levels = levels.masked_fill(graduated, float(self.cfg.terrain.num_rows - 1))
+        return levels.mean()
+
     def _update_terrain_curriculum(self, env_ids):
         """ Implements the game-inspired curriculum.
 
@@ -2324,6 +2587,12 @@ class LeggedRobot(BaseTask):
             move_up = move_up & (self.terrain_levels[env_ids] < int(max_promoted))
 
         self.terrain_levels[env_ids] += 1 * move_up - 1 * move_down
+        # Graduation latch (student only, cfg.terrain.count_graduated_in_mean_level):
+        # promoted past the last row => "graduated". resample_at_max_level below then drops
+        # that env back into [min, max-1], which is only an anti-forgetting re-sample, so
+        # remember it for fleet_mean_level().
+        if bool(getattr(self.cfg.terrain, "count_graduated_in_mean_level", False)):
+            self.graduated_buf[env_ids] |= (self.terrain_levels[env_ids] >= self.max_terrain_level)
         # cfg.terrain.min_terrain_level is a hard floor on the row an env may occupy, applied ONLY to envs that actually demoted this call, never as a blanket clamp.
         # play.py's eval sweep assigns terrain_levels directly and calls this method purely to refresh derived buffers, so flooring just the demotions leaves an explicit --eval_min_level 0 pin intact while keeping the floor airtight in training.
         _min_lvl = int(getattr(self.cfg.terrain, 'min_terrain_level', 0))
@@ -2697,6 +2966,10 @@ class LeggedRobot(BaseTask):
         self._dr_fleet_latency_ramp = None
         # Warm starts may pre-arm the fleet-level DR ramp.
         self.dr_ramp_armed = bool(getattr(self.cfg.domain_rand, "dr_ramp_start_armed", False))
+        # Monotonic latches for the DR ramp (domain_rand.dr_ramp_monotonic): highest
+        # normalized progress reached fleet-wide, and per env for the per-env-level ramp.
+        self._dr_ramp_alpha_hi = 0.0
+        self._dr_alpha_env = torch.zeros(self.num_envs, device=self.device)
         # Latch for the plant-failure early terminations: they stay OFF until the
         # fleet-average terrain level first reaches wococo_plant_fail_term_arm_mean_level,
         # then latch ON for the rest of the run (never disarm if the mean dips).
@@ -2756,6 +3029,11 @@ class LeggedRobot(BaseTask):
         self.commands_scale = torch.tensor([self.obs_scales.lin_vel, self.obs_scales.lin_vel, self.obs_scales.ang_vel], device=self.device, requires_grad=False,) # TODO change this
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
         self.last_contacts_obs = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
+        # Knee (thigh/calf) ground-contact episode trackers, logged at reset as
+        # contact/knee_*; threshold mirrors the hard-contact termination gate (10 N).
+        self.knee_contact_steps_ep = torch.zeros(self.num_envs, dtype=torch.long, device=self.device, requires_grad=False)
+        self.knee_max_force_ep = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
+        self._knee_contact_thresh = float(getattr(self.cfg.env, 'knee_contact_force_threshold', 10.0))
         self.contact_thresh = torch.full((self.num_envs, len(self.feet_indices)), 2., device=self.device, requires_grad=False)
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
@@ -3110,6 +3388,22 @@ class LeggedRobot(BaseTask):
         self.hip_body_indices = torch.zeros(len(hip_body_names), dtype=torch.long, device=self.device, requires_grad=False)
         for i, name in enumerate(hip_body_names):
             self.hip_body_indices[i] = body_names.index(name)
+
+        # RIGID-BODY indices of the thigh/calf ("knee/elbow") links for contact
+        # telemetry only -- no reward/termination reads these. Empty on assets
+        # without such links; every consumer guards on numel().
+        self.knee_body_indices = torch.as_tensor(
+            [i for i, n in enumerate(body_names) if ('thigh' in n or 'calf' in n)],
+            dtype=torch.long, device=self.device)
+
+        # RIGID-BODY indices of the four calf links, in [FR, FL, RR, RL] order. The calf
+        # link ORIGIN is the knee/elbow joint (thigh->calf hinge). Kept for the EP_KNEE_DIAG
+        # probe / diagnostics; the (now-removed) _reward_knee_clearance used these to read
+        # clearance at the joint itself.
+        calf_body_names = ["FR_calf", "FL_calf", "RR_calf", "RL_calf"]
+        self.calf_body_indices = torch.as_tensor(
+            [body_names.index(n) for n in calf_body_names if n in body_names],
+            dtype=torch.long, device=self.device)
     
     def _get_env_origins(self):
         """ Sets environment origins. On rough terrain the origins are defined by the terrain platforms.
@@ -3167,6 +3461,10 @@ class LeggedRobot(BaseTask):
                 self.terrain_levels = torch.randint(min_init_level, max_init_level+1, (self.num_envs,), device=self.device)
             self.terrain_types = torch.div(torch.arange(self.num_envs, device=self.device), (self.num_envs/self.cfg.terrain.num_cols), rounding_mode='floor').to(torch.long)
             self.max_terrain_level = self.cfg.terrain.num_rows
+            # Graduation latch (see fleet_mean_level): True once an env has been promoted
+            # past the last curriculum row; it is then re-sampled below but keeps counting
+            # as the top row in every fleet-mean-level statistic.
+            self.graduated_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             self.terrain_origins = torch.from_numpy(self.terrain.env_origins).to(self.device).to(torch.float)
             self.env_origins[:] = self.terrain_origins[self.terrain_levels, self.terrain_types]
             
@@ -3609,7 +3907,7 @@ class LeggedRobot(BaseTask):
         # GATED on the fleet-mean terrain level reaching yaw_post_sentinel_hold_min_mean_level, applied LAST so it wins over both gates above, and inert for non-wococo envs (latch stays -1). Yaw-only.
         if self._yaw_post_sentinel_hold_steps > 0:
             # Keep the fleet-mean-level gate as a 0-dim TENSOR and fold it into the per-env mask by broadcasting, so the comparison adds no per-step CPU/GPU sync.
-            mean_level_ok = (self.terrain_levels.float().mean()
+            mean_level_ok = (self.fleet_mean_level()
                              >= self._yaw_post_sentinel_hold_min_mean_level)
             in_hold = mean_level_ok & (self.wococo_sentinel_reached_step >= 0) & (
                 (self.episode_length_buf - self.wococo_sentinel_reached_step)
@@ -4027,7 +4325,7 @@ class LeggedRobot(BaseTask):
         # Scale the apex above the floor linearly in fleet-mean level: 0 at mean 0, nominal at hurdle_clearance_apex_full_mean_level. x roots and y extent are untouched.
         _apex_full = getattr(self.cfg.rewards, 'hurdle_clearance_apex_full_mean_level', None)
         if _apex_full is not None:
-            _apex_scale = float((self.terrain_levels.float().mean()
+            _apex_scale = float((self.fleet_mean_level()
                                  / max(float(_apex_full), 1e-6)).clamp(0.0, 1.0))
             if _apex_scale <= 0.0:
                 return torch.zeros(self.num_envs, device=self.device)
@@ -4647,7 +4945,7 @@ class LeggedRobot(BaseTask):
                             float(start) + 2.0))
         final = float(getattr(self.cfg.rewards,
                               'wococo_stage_anneal_final_frac', 0.0))
-        mean_lvl = float(self.terrain_levels.float().mean().item())
+        mean_lvl = float(self.fleet_mean_level().item())
         if end <= float(start):
             cand = final if mean_lvl >= float(start) else 1.0
         else:

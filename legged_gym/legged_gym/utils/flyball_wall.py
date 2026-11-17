@@ -212,6 +212,19 @@ def flyball_wall_terrain(
     wall_to_hurdle_rear_min: float         = None,
     # Scale hurdle jitters by difficulty (wall-angle jitter stays unscaled).
     hurdle_jitter_scale_with_difficulty: bool = False,
+    # Pin the row-lerped geometry knobs to their difficulty=1 value on EVERY row
+    # (wall base height delta_z, hurdle-top roughness ceiling); delta_x keeps main's
+    # difficulty lerp. Approach roughness amplitude is drawn per tile from the full
+    # 0.02-0.06 m range instead, and the per-tile "completely smooth" draw is NOT
+    # affected: half the approach tiles stay flat at every row. The heightfield is
+    # baked once at startup and envs still demote, so this is the only way to keep a
+    # demoted env from dropping onto easier terrain than it has already trained on.
+    geometry_at_max_difficulty: bool = False,
+    # Corridor-length jitters drawn one-sided (+ only): a nominal gap can only grow,
+    # never shrink, which protects the run-up length.
+    hurdle_jitter_one_sided: bool = False,
+    # Jitter (m) on the final return goal's gap behind the g4 anchor (was 0.30).
+    return_goal_gap_jitter_m: float = 0.30,
     # Per-hurdle AABBs. Slot 0 = forward (spawn → wall), slot 1 = backward.
     hurdle_liftoff_back: float    = 0.60,
     hurdle_liftoff_gap: float     = 0.20,
@@ -292,8 +305,28 @@ def flyball_wall_terrain(
     d = clamp(float(difficulty), 0.0, 1.0)
     hurdle_jitter_scale = d if hurdle_jitter_scale_with_difficulty else 1.0
 
+    def _jit(amp):
+        """Corridor-length jitter in metres, already scaled by difficulty.
+
+        Two-sided by default: U[-amp, +amp], so a gap can both grow and shrink.
+        One-sided mode only ever LENGTHENS a gap (U[0, amp]): the nominal layout is
+        then the shortest the course is allowed to get.
+        """
+        if amp <= 0.0:
+            return 0.0
+        if hurdle_jitter_one_sided:
+            return float(np.random.uniform(0.0, amp)) * hurdle_jitter_scale
+        return float(np.random.uniform(-amp, amp)) * hurdle_jitter_scale
+
+    # delta_x keeps main's difficulty lerp on EVERY row: it only feeds the
+    # takeoff/landing goal offsets and the forbidden-zone band, and the swimmer
+    # course gates on neither, so pinning it to the hardest value bought nothing.
     delta_x = lerp(pit_width_range[0], pit_width_range[1], d)   # kept for goal offset (same distance as when pit existed)
-    delta_z = lerp(pit_height_offset_range[0], pit_height_offset_range[1], d)
+    if geometry_at_max_difficulty:
+        # Max-difficulty wall base height from the very first row (see the flag's docstring).
+        delta_z = float(pit_height_offset_range[1])
+    else:
+        delta_z = lerp(pit_height_offset_range[0], pit_height_offset_range[1], d)
 
     # Sampled before wall placement: the wall toe is anchored to the last bar's rear.
     def _sample_hurdle_thickness_m():
@@ -359,46 +392,40 @@ def flyball_wall_terrain(
     compact_hx_a = compact_hx_b = None
     compact_hx2_a = compact_hx2_b = None
     if compact_layout:
-        front_dist_m = float(hurdle_front_from_spawn)
-        if hurdle_front_from_spawn_jitter > 0.0:
-            front_dist_m += float(np.random.uniform(
-                -hurdle_front_from_spawn_jitter,
-                hurdle_front_from_spawn_jitter)) * hurdle_jitter_scale
+        front_dist_m = float(hurdle_front_from_spawn) + _jit(hurdle_front_from_spawn_jitter)
         compact_hx_a = clamp(m2px(float(spawn_x) + front_dist_m), 0, terrain.width - 1)
         compact_hx_b = clamp(compact_hx_a + thk_px, compact_hx_a + 1, terrain.width)
 
         last_hurdle_back_px = compact_hx_b
         if add_second_hurdle:
-            gap_m = float(second_hurdle_offset)
-            if second_hurdle_offset_jitter > 0.0:
-                gap_m += float(np.random.uniform(
-                    -second_hurdle_offset_jitter,
-                    second_hurdle_offset_jitter)) * hurdle_jitter_scale
+            gap_m = float(second_hurdle_offset) + _jit(second_hurdle_offset_jitter)
             gap_px = max(1, m2px(gap_m))
             compact_hx2_a = clamp(compact_hx_b + gap_px, compact_hx_b + 1, terrain.width - 1)
             compact_hx2_b = clamp(compact_hx2_a + thk2_px, compact_hx2_a + 1, terrain.width)
             last_hurdle_back_px = compact_hx2_b
 
-        rear_gap_m = float(wall_to_hurdle_rear)
-        if wall_to_hurdle_rear_jitter > 0.0:
-            rear_gap_m += float(np.random.uniform(
-                -wall_to_hurdle_rear_jitter,
-                wall_to_hurdle_rear_jitter)) * hurdle_jitter_scale
-        # Floor the JITTERED value, not the nominal: with base 2.0 and jitter
-        # +-0.3 the raw draw reaches 1.70 m, not enough run-up to reach plant speed.
+        # The wall is NOT pinned to the tile's far edge: its x falls out of the sampled
+        # corridor, so the leftover length stays behind the wall. Neither the hurdles nor
+        # the wall are ever shifted or re-drawn: a draw longer than the tile simply takes
+        # whatever room is left (see below).
+        rear_gap_m = float(wall_to_hurdle_rear) + _jit(wall_to_hurdle_rear_jitter)
+        # Floor the JITTERED value, not the nominal: the -0.5 tail reaches 1.50 m,
+        # not enough run-up to reach plant speed.
         if wall_to_hurdle_rear_min is not None:
             rear_gap_m = max(rear_gap_m, float(wall_to_hurdle_rear_min))
-        rear_gap_px = max(1, m2px(rear_gap_m))
-        desired_wall_front_px = last_hurdle_back_px + rear_gap_px
-        desired_wall_x0 = desired_wall_front_px + (depth_px - 1)
         max_wall_x0 = terrain.width - dx_px - backing_depth_px
-        if desired_wall_x0 > max_wall_x0:
+        max_gap_px = max_wall_x0 - (depth_px - 1) - last_hurdle_back_px
+        if max_gap_px < 1:
             raise ValueError(
                 "compact flyball layout does not fit terrain tile: "
-                f"wall_x0={desired_wall_x0}, max={max_wall_x0}, "
-                f"tile_length={terrain.width * hs:.3f} m")
-        wall_x0 = clamp(desired_wall_x0, 0, max_wall_x0)
-        wall_front_px = desired_wall_front_px
+                f"hurdles end at {last_hurdle_back_px}, wall needs "
+                f"{depth_px - 1}+1 px, tile_length={terrain.width * hs:.3f} m")
+        # Nothing is shifted: the wall simply takes the room that is actually left.
+        # This only bites on ~0.002% of tiles (longest ramp angle, every gap at its
+        # max) and trims at most a few cm off the run-up.
+        rear_gap_px = min(max(1, m2px(rear_gap_m)), max_gap_px)
+        wall_front_px = last_hurdle_back_px + rear_gap_px
+        wall_x0 = clamp(wall_front_px + (depth_px - 1), 0, max_wall_x0)
         runup_m = (wall_x0 - p_len) * hs
     else:
         wall_x0 = clamp(
@@ -413,10 +440,20 @@ def flyball_wall_terrain(
     # Amplitude lerps roughness_height[0] (lvl0) -> roughness_height[1] (top), and
     # a per-tile draw leaves roughness_zero_prob of tiles completely smooth.
     roughness_zero_prob = min(max(float(roughness_zero_prob), 0.0), 1.0)
-    if random.random() < roughness_zero_prob:
-        rough_h = 0.0
+    if geometry_at_max_difficulty:
+        # Per-tile draw over the FULL amplitude range the rows used to cover
+        # (roughness_height[0] -> [1]), so every row sees the whole spread instead of
+        # a row-lerped constant. A demoted env therefore never lands on terrain that is
+        # strictly easier than what it may already have trained on.
+        rough_h = float(np.random.uniform(
+            float(roughness_height[0]), float(roughness_height[1])))
     else:
         rough_h = (roughness_height[1] - roughness_height[0]) * d + roughness_height[0]
+    # The per-tile "completely smooth" coin flip applies in BOTH modes: it is not a
+    # difficulty knob (a flat approach is drawn at every row), it only means half the
+    # approach tiles carry no random bumps at all.
+    if random.random() < roughness_zero_prob:
+        rough_h = 0.0
     terrain_utils.random_uniform_terrain(
         terrain,
         min_height=-rough_h, max_height=rough_h,
@@ -454,7 +491,11 @@ def flyball_wall_terrain(
     backing_height_m = max(float(backing_wall_height), delta_z + wall_height)
     backing_top_h = base_h + int(round(backing_height_m / vs))
     if build_wall:
-        backing = terrain.height_field_raw[backing_front_px:backing_back_px, :]
+        # Same lateral extent as the plate (2026-11-16): the full-width slice used to
+        # bury the ramp's shoulders behind 2 m of heightfield, which the real flyball
+        # course does not have — the backing structure is as wide as the plate.
+        backing = terrain.height_field_raw[backing_front_px:backing_back_px,
+                                           _plate_y_lo:_plate_y_hi]
         np.maximum(backing, backing_top_h, out=backing)
 
     # Hurdles are raised after the wall so they don't interact with the wall area.
@@ -525,7 +566,7 @@ def flyball_wall_terrain(
         )
         # lerp(floor, ceiling, difficulty), then a per-tile draw in [floor, amp_max].
         _hr_lo, _hr_hi = float(hurdle_roughness_height[0]), float(hurdle_roughness_height[1])
-        _hr_amp_max = lerp(_hr_lo, _hr_hi, d)
+        _hr_amp_max = _hr_hi if geometry_at_max_difficulty else lerp(_hr_lo, _hr_hi, d)
         _hr_amp = float(np.random.uniform(_hr_lo, _hr_amp_max)) if _hr_amp_max > 0.0 else 0.0
         _hr_cell_px = max(1, m2px(roughness_downsampled_scale))
 
@@ -643,7 +684,11 @@ def flyball_wall_terrain(
         # Return path: g4 sits 50 cm on the spawn side of hurdle 1; g5+ are
         # farther toward spawn by a per-tile distance sampled around 1.7 m.
         g4_x = clamp(float(hx_a) * hs - 0.50, 0.0, (terrain.width - 1) * hs)
-        g5_gap_m = 1.70 + float(np.random.uniform(-0.30, 0.30)) * hurdle_jitter_scale
+        g5_gap_m = 1.70 + _jit(return_goal_gap_jitter_m)
+        # Keep the return goal inside the tile by SHORTENING the gap instead of pinning
+        # g5 to a clamp bound: a pinned bound would collapse the tail draws onto one x,
+        # whereas a shortened gap still tracks the sampled corridor.
+        g5_gap_m = min(g5_gap_m, max(0.10, g4_x - 0.30))
         g5_x = clamp(g4_x - g5_gap_m, 0.0, (terrain.width - 1) * hs)
 
         if swimmer_goal_layout:

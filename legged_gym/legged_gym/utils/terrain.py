@@ -31,7 +31,11 @@
 import numpy as np
 from numpy.random import choice
 from scipy import interpolate
+import hashlib
+import os
+import pickle
 import random
+import time
 from isaacgym import terrain_utils
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
 from scipy import ndimage
@@ -43,9 +47,42 @@ from legged_gym.utils.flyball_wall import (
     flyball_wall_terrain,
     _hurdle_clear_boxes,
 )
+# Taken as a module attribute rather than `import legged_gym.utils.flyball_wall`:
+# utils/__init__.py imports Terrain, so the package is only half initialised here.
+from legged_gym.utils.flyball_wall import __file__ as _FLYBALL_WALL_SRC_FILE
 
 # A bar shorter than this counts as flat ground and gets no clearance volume.
 _HURDLE_CLEAR_MIN_H = 0.01
+
+# ---------------------------------------------------------------------------
+# Terrain build cache
+#
+# A cold build is three serial passes, all of which scale with
+# num_rows*num_cols: the per-tile heightfield writes (pure python), the Delatin
+# triangulation and PhysX' BVH construction. Measured on the 10x80 flyball map:
+# 355 s / 186 s / 168 s = 708 s. None of it depends on anything but
+# cfg.terrain and the RNG, so the result is reproducible and worth keeping on
+# disk -- the cache turns 708 s into ~15 s of I/O plus the 168 s of BVH that
+# PhysX has to redo in every process anyway.
+# ---------------------------------------------------------------------------
+
+# cfg.terrain fields that never change the heightfield or the mesh, so they must
+# stay out of the cache key: output paths and the VTS/PNG export knobs.
+_CACHE_KEY_SKIP = frozenset({
+    'use_cache', 'cache_dir', 'log_dir', 'save_vts', 'vts_export_cell_size',
+})
+
+# RNG state captured *after* a cold build, replayed on a hit so the rest of the
+# process sees the same random stream either way.
+_CACHE_RNG_KEY = '__rng_after_build__'
+
+# Terrain geometry depends on generator code as well as cfg + RNG. Including
+# these files in the key makes every old pickle miss automatically after an edit.
+_CACHE_GENERATOR_FILES = (
+    __file__,
+    _FLYBALL_WALL_SRC_FILE,
+    terrain_utils.__file__,
+)
 
 class Terrain:
     def __init__(self, cfg: LeggedRobotCfg.terrain, num_robots) -> None:
@@ -54,6 +91,29 @@ class Terrain:
         self.type = cfg.mesh_type
         if self.type in ["none", 'plane']:
             return
+
+        cache_path = self._cache_path()
+        if cache_path is not None and os.path.isfile(cache_path):
+            t0 = time.time()
+            with open(cache_path, 'rb') as f:
+                state = pickle.load(f)
+            rng_after = state.pop(_CACHE_RNG_KEY, None)
+            state.pop('cfg', None)      # the live cfg wins; it carries CLI overrides
+            self.__dict__.update(state)
+            # The cold build mutates the cfg as well; replay those two so a hit is
+            # indistinguishable from a cold build to every later reader.
+            cfg.terrain_proportions = np.array(cfg.terrain_proportions) / np.sum(cfg.terrain_proportions)
+            cfg.num_sub_terrains = cfg.num_rows * cfg.num_cols
+            # A cold build consumes the global RNG (hurdle heights/positions). Fast
+            # forward to the same point so cache/no-cache runs stay in lock-step.
+            if rng_after is not None:
+                np.random.set_state(rng_after['numpy'])
+                random.setstate(rng_after['python'])
+            print(f"[Terrain] CACHE HIT ({time.time() - t0:.1f}s) checksum "
+                  f"{int(self.height_field_raw.sum(dtype=np.int64))}: {cache_path}")
+            return
+
+        t0 = time.time()
         self.env_length = cfg.terrain_length
         self.env_width = cfg.terrain_width
 
@@ -105,11 +165,13 @@ class Terrain:
             self.curiculum()
         elif cfg.selected:
             self.selected_terrain()
-        else:    
-            if hasattr(cfg, "max_difficulty"):
-                self.curiculum(random=True, max_difficulty=cfg.max_difficulty)
-            else:
-                self.curiculum(random=True)
+        else:
+            # Row-based difficulty grid (d = i/(num_rows-1)), same as the
+            # curriculum build. curriculum=False only freezes the env->row draw
+            # (random row once, no promotion/demotion); per-tile difficulty is
+            # NOT randomised, so row == difficulty == wall angle and random row
+            # assignment keeps exposure uniform across all levels.
+            self.curiculum()
         
         self.heightsamples = self.height_field_raw
         if self.type=="trimesh":
@@ -148,7 +210,8 @@ class Terrain:
         if getattr(self.cfg, 'save_vts', False) and self.type == "trimesh":
             print("Saving [Terrain] heightfield as VTS...")
 
-            import os
+            # No local `import os` here: it would shadow the module-level one and
+            # make every earlier os.* reference in this method an UnboundLocalError.
             import pyvista as pv
             from datetime import datetime
 
@@ -282,6 +345,66 @@ class Terrain:
 
                 else:
                     print("[Terrain] No non-zero foothold targets to save (no wall tiles).")
+
+        print(f"[Terrain] built heightfield + mesh in {time.time() - t0:.1f}s, checksum "
+              f"{int(self.height_field_raw.sum(dtype=np.int64))}")
+        if cache_path is not None:
+            t0 = time.time()
+            try:
+                self._write_cache(cache_path)
+                print(f"[Terrain] cached ({time.time() - t0:.1f}s): {cache_path}")
+            except Exception as exc:    # a broken cache must never kill a run
+                print(f"[Terrain] WARNING: terrain cache write failed ({exc})")
+
+    def _cache_path(self):
+        """Pickle path for this exact terrain, or None when caching is off.
+
+        The key covers every cfg.terrain field reachable through the class MRO,
+        the terrain-generator source files, and numpy's RNG state, because the
+        build draws hurdle heights/positions from the global RNG. Hashing the
+        live state means a different seed or generator can only cause a miss,
+        never a stale hit.
+        """
+        if not bool(getattr(self.cfg, 'use_cache', True)):
+            return None
+        if os.environ.get('EP_TERRAIN_CACHE', '1').lower() in ('0', 'false', 'off'):
+            return None     # EP_TERRAIN_CACHE=0 forces a from-scratch build
+        if bool(getattr(self.cfg, 'save_vts', False)):
+            return None     # the VTS/VTP export is a side effect of a cold build
+        try:
+            digest = hashlib.sha1()
+            for key in sorted(dir(self.cfg)):
+                # Output paths are filled in after the config is loaded (log_dir
+                # tracks --exptid) and say nothing about the geometry.
+                if key.startswith('__') or key in _CACHE_KEY_SKIP:
+                    continue
+                value = getattr(self.cfg, key)
+                if callable(value) or isinstance(value, type):
+                    continue
+                digest.update(repr((key, value)).encode())
+            for source_path in _CACHE_GENERATOR_FILES:
+                digest.update(os.path.basename(source_path).encode())
+                with open(source_path, 'rb') as source_file:
+                    digest.update(source_file.read())
+            rng_state = np.random.get_state()
+            digest.update(np.asarray(rng_state[1], dtype=np.uint32).tobytes())
+            digest.update(str(rng_state[2]).encode())
+            root = getattr(self.cfg, 'cache_dir', None) or os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), '..', '..', 'logs', 'terrain_cache')
+            os.makedirs(root, exist_ok=True)
+            tag = f"r{self.cfg.num_rows}xc{self.cfg.num_cols}_hs{self.cfg.horizontal_scale}"
+            return os.path.join(root, f"{tag}_{digest.hexdigest()[:12]}.pkl")
+        except Exception as exc:
+            print(f"[Terrain] cache disabled ({exc})")
+            return None
+
+    def _write_cache(self, path):
+        state = {k: v for k, v in self.__dict__.items() if k != 'cfg'}
+        state[_CACHE_RNG_KEY] = {'numpy': np.random.get_state(), 'python': random.getstate()}
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, 'wb') as f:
+            pickle.dump(state, f, protocol=4)
+        os.replace(tmp, path)   # atomic: a concurrent run can never leave a half file
 
     def _save_hurdle_clearance_surfaces(self, out_path, border_m, samples=33):
         """Export only the extruded parabolic clearance volumes as VTP surfaces.
@@ -839,6 +962,12 @@ class Terrain:
                     self.cfg, 'flyball_wall_to_hurdle_rear_min', None),
                 hurdle_jitter_scale_with_difficulty=getattr(
                     self.cfg, 'flyball_hurdle_jitter_scale_with_difficulty', False),
+                geometry_at_max_difficulty=getattr(
+                    self.cfg, 'flyball_geometry_at_max_difficulty', False),
+                hurdle_jitter_one_sided=getattr(
+                    self.cfg, 'flyball_hurdle_jitter_one_sided', False),
+                return_goal_gap_jitter_m=getattr(
+                    self.cfg, 'flyball_return_goal_gap_jitter', 0.30),
                 hurdle_liftoff_back=getattr(self.cfg, 'flyball_hurdle_liftoff_back', 0.6),
                 hurdle_liftoff_gap=getattr(self.cfg, 'flyball_hurdle_liftoff_gap', 0.20),
                 hurdle_landing_forward=getattr(self.cfg, 'flyball_hurdle_landing_forward', 0.6),

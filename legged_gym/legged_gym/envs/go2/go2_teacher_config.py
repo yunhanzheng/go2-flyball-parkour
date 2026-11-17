@@ -117,20 +117,24 @@ class Go2TeacherCfg( Go2RoughCfg ):
         randomize_action_latency   = False
         randomize_proprio_latency  = False
         action_delay               = True
-        action_delay_latch_mean_level = 6.0
+        # Warm start: latch the fixed 1-step delay from step 0 (mature-row behavior);
+        # the fleet-mean trigger fires immediately at threshold 0.
+        action_delay_latch_mean_level = 0.0
         action_delay_latch_step       = None
         action_delay_ramp_steps       = 0
         randomize_contact_threshold = False
 
-        # Fleet-mean DR ramp: the ceiling reaches full DR at mean level 6, and each
-        # reset samples a per-env scale below it. Resumes are pre-armed by helpers.py.
+        # Fleet-mean DR ramp, pinned to its mature state for the warm start: full
+        # ceiling from step 0 (full_at=0 -> alpha=1), each reset still samples a
+        # per-env scale below it. start_armed is REQUIRED, not just cosmetic: the
+        # cold-start arming trigger (mean < 0.5) never fires on a warm fleet.
         dr_scale_range             = [0.0, 1.0]
         dr_lock_to_terrain_level   = True
         dr_ramp_use_mean_level     = True
         dr_scale_sample_per_env    = True
-        dr_ramp_full_at_mean_level = 6.0
+        dr_ramp_full_at_mean_level = 0.0
         dr_ramp_arm_below_mean_level = 0.5
-        dr_ramp_start_armed        = False
+        dr_ramp_start_armed        = True
 
     class noise(Go2RoughCfg.noise):
         # The DR ramp above scales these proprio/height noise samples by dr_scale;
@@ -195,18 +199,34 @@ class Go2TeacherCfg( Go2RoughCfg ):
         flyball_hurdle_clear_half_span         = 0.10
         flyball_hurdle_clear_box_height        = 0.17
         flyball_hurdle_roughness_height       = (0.0, 0.01)
-        flyball_hurdle_jitter_scale_with_difficulty = True
+        # Geometry knobs that used to lerp with the row are pinned to their HARDEST
+        # value on EVERY row (wall base height delta_z, hurdle-top roughness ceiling),
+        # and corridor jitter runs at full amplitude from row 0. delta_x keeps main's
+        # difficulty lerp: it only feeds the takeoff/landing offsets and the forbidden
+        # zone, none of which the swimmer course gates on.
+        # Approach roughness amplitude is NOT pinned: every tile draws 0.02-0.06 m
+        # uniformly, and the per-tile "completely smooth" draw (p=0.5) is kept as-is, so
+        # half the approach tiles stay flat at every row. The heightfield is baked once
+        # at startup while envs still demote, so pinning is the only way to stop the
+        # terrain getting easier than what was already trained on.
+        flyball_geometry_at_max_difficulty          = True
+        flyball_hurdle_jitter_scale_with_difficulty = False
+        # Corridor jitter stays two-sided: each gap is nominal + U[-0.5, +0.5] m.
+        flyball_hurdle_jitter_one_sided             = False
 
         flyball_spawn_x                       = 1.0
         flyball_hurdle_front_from_spawn       = 1.60
-        flyball_hurdle_front_from_spawn_jitter = 0.30
+        flyball_hurdle_front_from_spawn_jitter = 0.50
         flyball_second_hurdle_offset          = 2.00
-        flyball_second_hurdle_offset_jitter   = 0.30
+        flyball_second_hurdle_offset_jitter   = 0.50
         flyball_wall_to_hurdle_rear           = 2.00
-        flyball_wall_to_hurdle_rear_jitter    = 0.30
-        # Hard floor on the JITTERED hurdle-2-rear -> wall-toe gap: the -0.30 tail put
-        # the last hurdle 1.70 m from the wall, too little run-up for plant speed.
-        # Floors rather than shifts: ~half the tiles sit at 2.00 m, the rest 2.00-2.30 m.
+        flyball_wall_to_hurdle_rear_jitter    = 0.50
+        # Corridor jitter is two-sided (+-0.5 m on every gap, each drawn independently).
+        flyball_return_goal_gap_jitter        = 0.30
+        # Hard floor on the JITTERED hurdle-2-rear -> wall-toe gap: the -0.5 tail would
+        # otherwise put the last hurdle 1.50 m from the wall, too little run-up to reach
+        # plant speed. This clips the lower half of the draw, so the gap is ~50% exactly
+        # 2.00 m and otherwise uniform over [2.00, 2.50] m.
         flyball_wall_to_hurdle_rear_min       = 2.00
         flyball_post_hurdle_goal_distance     = 0.0
         flyball_randomize_return_goal_x        = True
@@ -260,17 +280,20 @@ class Go2TeacherCfg( Go2RoughCfg ):
         exempt_hurdle_contact_from_clip   = True
         exempt_hurdle_clearance_from_clip = False
         exempt_wococo_contact_pts_from_clip = True   # n_wrong must reach negative
-        # Clip only below level 2, so regularization bites once past cold start.
+        # Warm start: no positive-reward clipping on ANY row (the level<2 cold-start
+        # clip is disabled); penalty gradients are live from step 0.
         only_positive_rewards_exempt_high_levels = True
-        only_positive_rewards_clip_below_level    = 2
+        only_positive_rewards_clip_below_level    = 0
 
-        # Arms at a fixed iteration, not a level: a level trigger feeds back (the
-        # penalty demotes the fleet, and demotion then disarms it).
-        hurdle_clearance_arm_step             = 2000 * 24
+        # Warm start: armed AND full-strength from step 0 (arm_step=0 fires the
+        # trigger immediately, ramp_steps=0 makes alpha=1 at once). Kept as a fixed
+        # step trigger, not a level trigger: a level trigger feeds back (the penalty
+        # demotes the fleet, and demotion then disarms it).
+        hurdle_clearance_arm_step             = 0
         hurdle_clearance_apex_full_mean_level = None
         hurdle_clearance_arm_mean_level       = 0.0
         hurdle_clearance_ramp_delay_steps     = 0
-        hurdle_clearance_ramp_steps           = 4000 * 24
+        hurdle_clearance_ramp_steps           = 0
         hurdle_clearance_per_env_draw        = True
         hurdle_pair_sym_sigma_rad             = 0.40   # summed mirror error per pair
 
@@ -310,13 +333,14 @@ class Go2TeacherCfg( Go2RoughCfg ):
         wococo_stage_reward_mode    = 'oneshot_linear'
         wococo_n_wrong_weight       = 1.0
 
-        # Anneal the one-shot stage bonus to zero on FLEET-MEAN terrain level: it buys
+        # One-shot stage bonus annealed to zero on FLEET-MEAN terrain level: it buys
         # its faster curriculum onset below level 5, and kept live afterwards it keeps
-        # compressing the plant trigger against distribution-specific cues. Ramps
-        # 25 -> 0 over fleet-mean level 5 -> 7 and LATCHES, so demotions and resumes
-        # cannot resurrect it. The FSM is unaffected; start = None disables.
-        wococo_stage_anneal_start_mean_level = 5.0
-        wococo_stage_anneal_end_mean_level   = 7.0
+        # compressing the plant trigger against distribution-specific cues. Warm start:
+        # start=end=0 takes the end<=start branch, so the factor is final_frac=0 from
+        # step 0 (the mature fleet-mean>=7 state) and LATCHES there. The FSM is
+        # unaffected; start = None would instead disable the anneal (factor 1.0).
+        wococo_stage_anneal_start_mean_level = 0.0
+        wococo_stage_anneal_end_mean_level   = 0.0
         wococo_stage_anneal_final_frac       = 0.0
 
         # Posture-only LANDING (stage 2), ON: stage 2 stops regulating foot contacts
@@ -347,8 +371,10 @@ class Go2TeacherCfg( Go2RoughCfg ):
         # Per-wall-angle radii OFF: every consumer falls back to its flat scalar below.
         # A dict re-enables it (interpolated per env angle, clamped outside 30-80 deg).
         wococo_per_angle_radii = None
-        # Cold-start gates, restricted to bootstrap levels 0-3; above level 3 the scalar mature-row tolerances hold.
-        wococo_per_angle_radii_low_below_level = 4
+        # Warm start: the cold-start low table is disabled on EVERY row (below_level=0
+        # -> the level<0 mask is always empty); the scalar mature-row tolerances hold
+        # everywhere, as they do at level >= 4.
+        wococo_per_angle_radii_low_below_level = 0
         wococo_per_angle_radii_low = {
             30.0: (0.500, 0.12, 0.35, 0.15, 0.850, 0.20),
             35.0: (0.480, 0.12, 0.35, 0.15, 0.820, 0.20),
@@ -376,7 +402,8 @@ class Go2TeacherCfg( Go2RoughCfg ):
         # Plant-FSM eases reverted to 125a41f: full-strength stage-0 rear-air
         # gate and 40 deg stage-1 yaw tolerance from level 0 (no bootstrap ease).
         enable_wococo_plant_fail_termination = True
-        wococo_plant_fail_term_arm_mean_level = 4.0
+        # Warm start: armed from step 0 (mature-row behavior).
+        wococo_plant_fail_term_arm_mean_level = 0.0
         # Kill the episode when the base overshoots the landing footholds toward spawn
         # by more than this. RAISED 0.15 -> 0.45 for the posture-only landing, putting
         # it in DIRECT CONFLICT with the stage-2 gate, which demands
@@ -392,7 +419,8 @@ class Go2TeacherCfg( Go2RoughCfg ):
         wococo_stage1_ground_max_z           = 0.05
 
         enable_wococo_armed_term_exempt      = True
-        wococo_armed_term_exempt_min_mean_level = 6.0
+        # Warm start: exempt window active from step 0 (mature-row behavior).
+        wococo_armed_term_exempt_min_mean_level = 0.0
         wococo_armed_term_exempt_ramp_steps  = 0
         wococo_armed_roll_term_max_deg       = None
         wococo_armed_pitch_term_max_deg      = None

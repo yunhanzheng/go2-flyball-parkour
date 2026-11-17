@@ -115,7 +115,18 @@ python train.py --task go2_student --exptid my-student --device cuda:0 \
 # warm start from the released flat-terrain base policy
 python train.py --task go2_teacher --exptid new-run \
     --resume --resumeid flat_baseline --device cuda:0 --headless
+
+# depth student, trained with the teacher objective on the depth latent
+# (surrogate + value + estimator), see docs/depth_rl_full_ppo.md
+python train.py --task go2_student --exptid my-student-depth-ppo --device cuda:0 \
+    --resume --resumeid student --checkpoint 10000 \
+    --use_camera --delay --depth_rl --freeze
 ```
+
+`--depth_rl` requires `--use_camera` and switches the runner to
+`learn_depth_rl`, which keeps the depth chain (`depth -> encoder -> latent ->
+depth_actor`) but optimises the teacher's full loss set. `--freeze` in that mode
+only freezes the depth encoder; `depth_actor`, `critic` and `estimator` train.
 
 Checkpoints go to `legged_gym/logs/<proj_name>/<exptid>/` (`--proj_name` defaults to
 `extreme-parkour`) with the resolved `env_cfg.pkl`, which `play.py` prefers over the live

@@ -46,6 +46,21 @@ class RecurrentDepthBackbone(nn.Module):
         
         return depth_latent
 
+    def forward_step(self, depth_image, proprioception, hidden_in):
+        """One GRU step with an EXPLICIT input hidden state.
+
+        learn_depth_rl replays the encoder inside the PPO update so the policy
+        gradient reaches base_backbone / combination_mlp / output_mlp. The GRU
+        input is the hidden state captured during the rollout (detached), i.e.
+        truncated BPTT(1) -- the same truncation detach_hidden_states() applies
+        between iterations. self.hidden_states is deliberately left untouched so
+        the rollout's recurrent state is not disturbed by the update.
+        """
+        depth_image = self.base_backbone(depth_image)
+        depth_latent = self.combination_mlp(torch.cat((depth_image, proprioception), dim=-1))
+        depth_latent, _ = self.rnn(depth_latent[:, None, :], hidden_in)
+        return self.output_mlp(depth_latent.squeeze(1))
+
     def detach_hidden_states(self):
         self.hidden_states = self.hidden_states.detach().clone()
 

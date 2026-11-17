@@ -875,15 +875,37 @@ def play(args):
     if args.nodelay:
         # Legacy/scheduled-delay tasks: flatten the viewer delay to 0.
         env_cfg.domain_rand.action_delay_view = 0
-    env_cfg.env.num_envs = 16 if not args.save else 64
-    env_cfg.env.episode_length_s = 60
-    env_cfg.commands.resampling_time = 60
-    env_cfg.terrain.num_rows = 10
     # One column when only rendering: on the 1 cm heightfield 5 columns is ~47 M
     # triangles per frame for ONE robot. Analysis keeps 5 for per-column tile jitter.
-    env_cfg.terrain.num_cols = 1 if _need_viewer else 5
-    env_cfg.terrain.max_init_terrain_level = env_cfg.terrain.num_rows - 1
-    env_cfg.terrain.height = [0.02, 0.02]
+    _play_cols = 1 if _need_viewer else 5
+    if getattr(args, "as_train", False):
+        # --as_train: replay the training configuration verbatim. play's own
+        # evaluation defaults (60 s episodes, 60 s command resampling, a fixed 2 cm
+        # heightfield, a 20 deg camera) all differ from what the run trained on, so a
+        # clip recorded with them is not the training distribution. NOTE the biggest
+        # one: with commands.curriculum=False legged_robot._parse_cfg takes
+        # commands.max_ranges (e.g. lin_vel_x=[1,1], i.e. a constant 1 m/s), whereas
+        # training takes commands.ranges ([0,1]) and widens it live.
+        # An explicit --num_envs wins here: a replay running beside a live 512-env
+        # training job only has ~2.7 GB of VRAM left, so 16 envs OOM even though the
+        # rest of the training config is unchanged.
+        env_cfg.env.num_envs = (int(args.num_envs) if getattr(args, "num_envs", None)
+                                else (16 if not args.save else 64))
+        env_cfg.terrain.num_rows = 10
+        env_cfg.terrain.num_cols = _play_cols
+        env_cfg.terrain.max_init_terrain_level = env_cfg.terrain.num_rows - 1
+        print(f"[play] --as_train: episode_length_s={env_cfg.env.episode_length_s:g}s, "
+              f"resampling_time={env_cfg.commands.resampling_time:g}s, "
+              f"terrain.height={env_cfg.terrain.height}, depth.angle={env_cfg.depth.angle} "
+              f"kept from the {args.task} config")
+    else:
+        env_cfg.env.num_envs = 16 if not args.save else 64
+        env_cfg.env.episode_length_s = 60
+        env_cfg.commands.resampling_time = 60
+        env_cfg.terrain.num_rows = 10
+        env_cfg.terrain.num_cols = _play_cols
+        env_cfg.terrain.max_init_terrain_level = env_cfg.terrain.num_rows - 1
+        env_cfg.terrain.height = [0.02, 0.02]
     if getattr(args, 'zero_terrain_roughness', False):
         if getattr(args, 'terrain_height', None) is not None:
             raise ValueError("--zero_terrain_roughness conflicts with --terrain_height")
@@ -989,7 +1011,9 @@ def play(args):
         env_cfg.terrain.fixed_level = True     # every env spawns on row `lvl`
         env_cfg.terrain.no_demotion = True     # freeze: no move_down
         env_cfg.terrain.max_promoted_level = -1  # freeze: no move_up
-        env_cfg.commands.curriculum = False
+        if not getattr(args, "as_train", False):
+            # play pins the command ranges; --as_train keeps the training curriculum.
+            env_cfg.commands.curriculum = False
         _rng = getattr(env_cfg.terrain, 'flyball_wall_angle_deg_range', None)
         if _rng is not None and env_cfg.terrain.num_rows > 1:
             _d = lvl / (env_cfg.terrain.num_rows - 1)
@@ -1008,7 +1032,8 @@ def play(args):
     
     # Depth camera pitch (deg down). Default 20 = training nominal (depth.angle=[15,25],
     # i.e. 20 +-5 deg mount noise); any other value is a camera it never trained on.
-    env_cfg.depth.angle = [20, 20]
+    if not getattr(args, "as_train", False):
+        env_cfg.depth.angle = [20, 20]
 
     # --cam_pitch_deg: override the 20 deg default (e.g. 7.6, the real Go2 mount).
     if getattr(args, "cam_pitch_deg", None) is not None:
@@ -1377,8 +1402,11 @@ def play(args):
 
     video_writer = None
     video_cam = None
-    VIDEO_W, VIDEO_H = 1920, 1080
-    VIDEO_CAM_W, VIDEO_CAM_H = 1920, 1080
+    # Overridable for hosts without a usable Vulkan device (llvmpipe): 1080p
+    # software rasterisation is both very slow and prone to crashing.
+    VIDEO_W = int(os.environ.get('PLAY_VIDEO_W', 1920))
+    VIDEO_H = int(os.environ.get('PLAY_VIDEO_H', 1080))
+    VIDEO_CAM_W, VIDEO_CAM_H = VIDEO_W, VIDEO_H
     # Render every VIDEO_STEP_DECIM-th step; writer fps is divided to match.
     VIDEO_STEP_DECIM = 2
     if args.video:
@@ -1431,6 +1459,10 @@ def play(args):
     _dstat = {'n': 0, 'nd': 0, 'invalid': 0.0, 'jump': 0.0, 'jitter': 0.0, 'prev': None}
     # Last-episode termination reason per env (lookat_id can switch mid-run).
     _last_term_text = ["none yet"] * env.num_envs
+    # --dump_terms: a per-step, per-term reward ledger so a stall can be attributed
+    # to specific penalties instead of guessing from the aggregate reward.
+    _terms_path = getattr(args, 'dump_terms', None)
+    _terms_rows = []
 
     # Headless failure-mode analysis: levels are PINNED (evaluation_mode gates the
     # curriculum updates) and row i has difficulty i/(num_rows-1) — do NOT use
@@ -1559,6 +1591,35 @@ def play(args):
     # carries its GRU state across steps, so with grad enabled the autograd graph
     # chains the whole rollout. Invisible at 600 steps, fatal by ~3k.
     torch.set_grad_enabled(False)
+    # Opt-in knee (thigh/calf) ground-contact diagnostic (EP_KNEE_DIAG=1): counts steps
+    # where any thigh/calf rigid body sees a >thresh contact force, using the SAME
+    # aperture as the episode's contact/knee_* training telemetry. Runs in video and
+    # headless modes; off by default so it never perturbs stock play.
+    _knee_diag = os.environ.get('EP_KNEE_DIAG', '') == '1'
+    _knee_hits = []
+    _knee_steps = 0
+    _knee_peak = 0.0
+    _knee_ground_steps = 0     # contacts whose knee joint is essentially ON the terrain
+    _knee_hit_envs = None
+    if _knee_diag:
+        _knee_idx = env.knee_body_indices
+        _knee_thr = float(getattr(env, '_knee_contact_thresh', 10.0))
+        _knee_bnames = env.gym.get_actor_rigid_body_names(env.envs[0], env.actor_handles[0])
+        _knee_hit_envs = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        _knee_names = [_knee_bnames[int(_b)] for _b in _knee_idx.tolist()]
+        # Terrain -> world mapping to sample ground height under a knee joint. The calf
+        # link origin IS the knee, so "knee on the ground" == its z minus the terrain z
+        # beneath it is at (or below) the collision-skin margin. This separates a real
+        # floor scrape from a shin pressed on the inclined flyball wall (the wall is
+        # baked into the same heightfield, so net contact force alone cannot tell them).
+        _kt_hs = env.terrain.cfg.horizontal_scale
+        _kt_vs = env.terrain.cfg.vertical_scale
+        _kt_border = env.terrain.border
+        _kt_hf = env.terrain.height_field_raw
+        _kt_hf_r, _kt_hf_c = _kt_hf.shape
+        _knee_low_margin = 0.09  # m: knee joint this close to terrain (or below) => on ground
+        print(f'[knee] diag ON: bodies={_knee_names}, thresh={_knee_thr:.1f} N, '
+              f'ground-margin={_knee_low_margin} m')
     for i in range(num_steps):
         if i % _step_log_every == 0 or i == num_steps - 1:
             _el = time() - _t_loop_start
@@ -1645,6 +1706,33 @@ def play(args):
 
         obs, _, rews, dones, infos = env.step(actions.detach())
 
+        if _knee_diag:
+            _kf = torch.norm(env.contact_forces[:, _knee_idx, :], dim=-1)   # (num_envs, n_knee)
+            _kh = (_kf > _knee_thr)
+            _hit_any = _kh.any(dim=1)
+            _knee_hit_envs += _hit_any.long()
+            _knee_steps += int(_hit_any.any().item())
+            if bool(_hit_any.any().item()):
+                _knee_peak = max(_knee_peak, float(_kf.max()))
+                _step_ground = False
+                _rs = env.rigid_body_states
+                for _eid, _kid in _kh.nonzero(as_tuple=False).tolist():
+                    _b = int(_knee_idx[_kid])
+                    _cx, _cy, _cz = _rs[_eid, _b, 0].item(), _rs[_eid, _b, 1].item(), _rs[_eid, _b, 2].item()
+                    _r = min(max(int(round(_cx / _kt_hs)) + _kt_border, 0), _kt_hf_r - 1)
+                    _c = min(max(int(round(_cy / _kt_hs)) + _kt_border, 0), _kt_hf_c - 1)
+                    _gz = float(_kt_hf[_r, _c]) * _kt_vs
+                    _ag = _cz - _gz                 # knee joint height above local terrain
+                    _on_ground = _ag < _knee_low_margin
+                    _step_ground |= _on_ground
+                    if len(_knee_hits) < 400:
+                        _knee_hits.append((i, _knee_bnames[_b], float(_kf[_eid, _kid]),
+                                           float(env.root_states[_eid, 0]), _ag, _gz,
+                                           float(env.root_states[_eid, 2]), _on_ground,
+                                           int(env.episode_length_buf[_eid])))
+                if _step_ground:
+                    _knee_ground_steps += 1
+
         _stage_t = i * env.dt
         _stage_in_window = (
             _stage_t >= args.depth_stage_start_seconds and
@@ -1719,6 +1807,24 @@ def play(args):
         if args.overlays:
             _draw_hurdle_clearance_parabolas(env)
 
+        if _terms_path is not None and getattr(env, 'last_step_rews', None):
+            _te = int(env.lookat_id)
+            _row = {
+                'step': i,
+                'root_x': float(env.root_states[_te, 0]),
+                'root_y': float(env.root_states[_te, 1]),
+                'root_z': float(env.root_states[_te, 2]),
+                'cmd_vx': float(env.commands[_te, 0]) if hasattr(env, 'commands') else 0.0,
+                'goal_idx': int(env.cur_goal_idx[_te]) if hasattr(env, 'cur_goal_idx') else -1,
+                'stage': int(env.wococo_contact_stage[_te]) if hasattr(env, 'wococo_contact_stage') else -1,
+                'armed': int(env.wococo_armed[_te]) if hasattr(env, 'wococo_armed') else -1,
+                'ep_step': int(env.episode_length_buf[_te]),
+                'rew_total_clipped': float(rews[_te]),
+            }
+            for _k, _v in env.last_step_rews.items():
+                _row[_k] = float(_v[_te])
+            _terms_rows.append(_row)
+
         # Realized degradation on the frames the ENCODER consumed, in the three metrics
         # the model was calibrated on (1.30% invalid, 0.558% big-jump, 0.0137 m jitter).
         if _dns is not None and infos.get("depth", None) is not None:
@@ -1747,6 +1853,9 @@ def play(args):
                 code = int(env.last_term_code[eid].item())
                 _last_term_text[eid] = (f"{TERM_CODE_NAMES.get(code, 'unknown')} "
                                         f"(code {code}, step {i})")
+                # Print the reason while recording: the mp4 alone hides why it fell.
+                if video_writer is not None:
+                    print(f"[play] Episode ended: env {eid} -> {_last_term_text[eid]}")
         if _need_viewer:
             web_viewer.last_term_reason = _last_term_text[env.lookat_id]
 
@@ -1874,6 +1983,14 @@ def play(args):
                 env.reset_idx(torch.tensor([id], device=env.device))
                 pos_history.clear()
 
+    if _terms_path is not None and _terms_rows:
+        import csv
+        with open(_terms_path, 'w', newline='') as _f:
+            _w = csv.DictWriter(_f, fieldnames=list(_terms_rows[0].keys()), restval=0.0)
+            _w.writeheader()
+            _w.writerows(_terms_rows)
+        print(f'[terms] wrote {len(_terms_rows)} steps x {len(_terms_rows[0])} columns -> {_terms_path}')
+
     if video_writer is not None:
         video_writer.close()
         print(f"[video] Saved to {video_path}")
@@ -1881,6 +1998,33 @@ def play(args):
     if _eval_stats is not None:
         print(f'[eval] === FINAL summary after {i + 1} steps ===')
         _print_eval_summary(_eval_stats, _wall_angles)
+
+    if _knee_diag:
+        _nsteps = max(i + 1, 1)
+        print(f'[knee] === summary after {_nsteps} steps ===')
+        print(f'[knee] any >{_knee_thr:.0f}N thigh/calf contact (incl. shin-on-wall): '
+              f'{_knee_steps}/{_nsteps} steps ({100.0 * _knee_steps / _nsteps:.1f}%)  peak={_knee_peak:.1f} N')
+        print(f'[knee] knee joint actually ON the ground (<{_knee_low_margin}m above terrain): '
+              f'{_knee_ground_steps}/{_nsteps} steps '
+              f'({100.0 * _knee_ground_steps / _nsteps:.2f}%)')
+        print(f'[knee] envs with any contact: {int((_knee_hit_envs > 0).sum())}/{env.num_envs}')
+        _bcount = defaultdict(int)
+        _bground = defaultdict(int)
+        for _h in _knee_hits:
+            _bcount[_h[1]] += 1
+            if _h[7]:
+                _bground[_h[1]] += 1
+        if _bcount:
+            print('[knee] per-body: ' + ', '.join(
+                f'{k}: {_v} hits ({_bground.get(k, 0)} on-ground)' for k, _v in sorted(_bcount.items())))
+            print(f'[knee] hits (step, body, force_N, root_x_m, knee_above_ground_m, '
+                  f'terrain_z_m, root_z_m, ON_GROUND, ep_step):')
+            for _h in _knee_hits[:15]:
+                print(f'   step={_h[0]:4d}  {_h[1]:12s}  {_h[2]:6.1f} N  root_x={_h[3]:5.2f}  '
+                      f'knee_ag={_h[4]:6.3f}  terr_z={_h[5]:5.2f}  root_z={_h[6]:5.2f}  '
+                      f'GROUND={int(_h[7])}  ep_step={_h[8]}')
+        else:
+            print('[knee] NO thigh/calf contact above threshold in this rollout')
 
     if _ff_target > 0:
         _write_foot_force_outputs(
@@ -1892,7 +2036,22 @@ if __name__ == '__main__':
     EXPORT_POLICY = False
     RECORD_FRAMES = False
     MOVE_CAMERA = False
+    # --as_train is play-only, and get_args() is shared with train.py, so it is not
+    # registered there. Strip it from argv before parsing (an unregistered flag makes
+    # argparse exit with "unrecognized arguments") and hand it to args by hand.
+    _as_train = '--as_train' in sys.argv[1:]
+    if _as_train:
+        sys.argv = [a for a in sys.argv if a != '--as_train']
+    # --dump_terms is play-only for the same reason: it writes a per-step, per-term
+    # reward ledger so a stall can be attributed to specific penalties.
+    _dump_terms = None
+    if '--dump_terms' in sys.argv[1:]:
+        _di = sys.argv.index('--dump_terms')
+        _dump_terms = sys.argv[_di + 1]
+        del sys.argv[_di:_di + 2]
     args = get_args()
+    args.as_train = _as_train
+    args.dump_terms = _dump_terms
 
     # play.py convenience defaults so the common eval command is just
     #   python play.py --exptid xxx

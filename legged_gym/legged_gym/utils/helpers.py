@@ -235,8 +235,23 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             cfg_train.seed = args.seed
         if args.use_camera:
             cfg_train.depth_encoder.if_depth = args.use_camera
+        if getattr(args, "depth_rl", False):
+            if not args.use_camera:
+                raise SystemExit(
+                    "[train] ERROR: --depth_rl trains the depth student, so it needs "
+                    "the camera pipeline: add --use_camera.")
+            cfg_train.depth_encoder.rl_depth = True
+            print("[train] --depth_rl: depth student learns with PPO on the env "
+                  "reward (learn_depth_rl); only the teacher actor stays frozen. "
+                  "Critic / estimator / depth encoder / history head follow the "
+                  "depth_encoder rl_* config (see the [ppo] depth-RL ON line).")
         if args.max_iterations is not None:
             cfg_train.runner.max_iterations = args.max_iterations
+        if getattr(args, "save_interval", None) is not None:
+            # go2_student ships save_interval=1000, which is useless on a depth run
+            # (113 s/iter): the only checkpoints would be model_0 and the final one.
+            cfg_train.runner.save_interval = args.save_interval
+            print(f"[train] --save_interval: checkpoint every {args.save_interval} iters")
         if getattr(args, "lr_floor", None) is not None:
             cfg_train.algorithm.min_learning_rate = args.lr_floor
             print(f"[train] --lr_floor: adaptive-LR floor {args.lr_floor:.2e} "
@@ -278,6 +293,8 @@ def get_args():
         {"name": "--cold_start", "action": "store_true", "default": False, "help": "Start every curriculum environment at terrain row 0."},
         {"name": "--seed", "type": int, "help": "Random seed. Overrides config file if provided."},
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
+        {"name": "--save_interval", "type": int, "default": None,
+         "help": "train.py: override runner.save_interval, the iteration gap between model_<it>.pt checkpoints. go2_student defaults to 1000, too coarse for the depth path (~113 s/iter)."},
         {"name": "--lr_floor", "type": float, "default": None, "help": "Lower clamp of the KL-adaptive learning rate (algorithm.min_learning_rate, default 1e-5). The per-minibatch KL schedule saturates at this floor on warm resumes, so this is effectively the post-saturation lr."},
         {"name": "--device", "type": str, "default": "cuda:0", "help": 'Device for sim, rl, and graphics'},
 
@@ -291,6 +308,8 @@ def get_args():
         {"name": "--resumeid", "type": str, "help": "exptid"},
         {"name": "--daggerid", "type": str, "help": "name of dagger run"},
         {"name": "--use_camera", "action": "store_true", "default": False, "help": "render camera for distillation"},
+        {"name": "--depth_rl", "action": "store_true", "default": False,
+         "help": "train.py: with --use_camera, optimise the depth student with PPO on the environment reward (learn_depth_rl) instead of DAgger's L2 imitation of the teacher. Same depth -> encoder -> actor pipeline and the same rollout cost; the depth encoder, the teacher and the privileged critic stay frozen, only depth_actor (+ its action std) is updated. Use it to measure what a distilled student can actually hold on the curriculum, not how well it copies the teacher."},
         {"name": "--depth_hole_fill", "action": "store_true", "default": False,
          "help": "apply deployment-compatible RealSense hole fill as the final depth preprocessing step"},
         {"name": "--no_depth_hole_fill", "action": "store_true", "default": False,
@@ -315,6 +334,7 @@ def get_args():
 
         {"name": "--task_both", "action": "store_true", "default": False, "help": "Both climbing and hitting policies"},
         {"name": "--nodelay", "action": "store_true", "default": False, "help": "Remove the action delay: zeroes the viewer delay on scheduled-delay tasks, and on latch-mode tasks (cliffside) disables the fixed 1-step deploy delay entirely (NOT deploy-faithful)"},
+        {"name": "--freeze", "action": "store_true", "default": False, "help": "train.py: inference-only run. EVERY optimiser lr on the algorithm (PPO actor-critic, history encoder, estimator, and the depth-distillation depth_actor/depth_encoder pair -- the one that actually steps the student) plus the adaptive-KL min/max floor is pinned to 0.0 AFTER the checkpoint is loaded, so rollout, logging, curriculum and TB curves run exactly as in training while an lr=0 Adam step cannot move a weight. requires_grad stays on because PPO still calls backward. A sha1 fingerprint of the teacher + estimator + depth student state_dicts is printed before and after to prove nothing moved"},
         {"name": "--full-dr", "dest": "full_dr", "action": "store_true", "default": False, "help": "play.py: use EXACT training domain randomization incl. per-env action latency under the viewer (play defaults to --no-dr; this turns the training DR back on). No-op for latency on latch-mode tasks, which use a fixed delay instead of latency DR"},
         {"name": "--no-dr", "dest": "no_dr", "action": "store_true", "default": False, "help": "play.py (default there unless --full-dr) + train.py: disable ALL domain randomization (friction/mass/CoM/motor/PD/latency/pushes/restitution) + observation noise for clean deterministic dynamics. The fixed deploy action delay is kept (it is an enforced constant, not DR) — use --nodelay to drop it too"},
         {"name": "--no_depth_noise", "dest": "no_depth_noise", "action": "store_true", "default": False, "help": "play.py: disable EVERY depth-camera degradation (dis_noise, gaussian/dropout, parkour-in-the-wild block, stereo shadow, per-env noise curriculum) so the rendered depth is the clean geometric ray-cast. Sensor-physics constants (empty_below_m, far_clip) are KEPT — they are not noise."},
@@ -379,6 +399,8 @@ def get_args():
          "help": "Lock all environments to the hardest terrain level (num_rows-1), disabling curriculum."},
         {"name": "--level", "type": int, "default": None,
          "help": "Lock all environments to this exact terrain level (disables curriculum). Overrides --max_level. play.py defaults to 8 for video/--web replays."},
+        {"name": "--min_terrain_level", "type": int, "default": None,
+         "help": "train.py: floor for the INITIAL terrain-level draw (cfg.terrain.min_terrain_level) — start the run at level N. Unlike --level it does NOT lock the level: the live curriculum keeps promoting and demoting exactly as in training, so this is the single knob go2_student takes from the distillation flow (min_terrain_level=4) and it can be applied to a teacher run to put it on the same level band."},
         {"name": "--eval_min_level", "type": int, "default": 0,
          "help": "play.py headless analysis mode only: restrict the pinned-level round-robin to rows [eval_min_level, num_rows-1]. Use to score only the band the curriculum actually trains (e.g. 4 when terrain.resample_min_level=4). Unlike --level it keeps the deterministic per-row difficulty."},
         {"name": "--eval_max_level", "type": int, "default": None,

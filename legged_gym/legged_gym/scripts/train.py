@@ -28,6 +28,7 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
+import hashlib
 import numpy as np
 import os
 import pickle
@@ -39,6 +40,88 @@ from legged_gym.envs import *
 from legged_gym.utils import get_args, task_registry
 import torch
 import wandb
+
+
+# Every optimiser the algorithm can step. A depth-distillation run (learn_vision)
+# never touches `optimizer` -- that one only exists for the privileged teacher --
+# and the ACTING policy there is `depth_actor`, stepped by `depth_actor_optimizer`
+# (which also owns the depth encoder's parameters). Freezing PPO's lr alone would
+# therefore leave the student learning.
+_OPTIMIZER_ATTRS = (
+    'optimizer',
+    'hist_encoder_optimizer',
+    'estimator_optimizer',
+    'depth_encoder_optimizer',
+    'depth_actor_optimizer',
+    # Depth-RL only (learn_depth_rl): PPO on depth_actor + its action std.
+    'depth_rl_optimizer',
+    # Depth-RL only: the teacher's objective set applied to the depth chain also
+    # trains the privileged critic (value loss) and the estimator, each with its
+    # own optimiser, plus the history encoder (the update_dagger() regression,
+    # which needs its own optimiser because it is excluded from depth_rl_optimizer).
+    'critic_optimizer',
+    'depth_hist_encoder_optimizer',
+)
+
+# Modules whose state_dict is fingerprinted: the privileged teacher, the estimator
+# that feeds the student its deploy-like state, and the depth student itself.
+_FINGERPRINT_ATTRS = ('actor_critic', 'estimator', 'depth_encoder', 'depth_actor')
+
+
+def _optimizers(alg):
+    return [(name, getattr(alg, name)) for name in _OPTIMIZER_ATTRS
+            if getattr(alg, name, None) is not None]
+
+
+def freeze_policy(runner, skip=()):
+    """Make the run inference-only: nothing any optimiser touches can move.
+
+    Only learning rates are pinned. requires_grad is deliberately KEPT on:
+    PPO always calls loss.backward() during update(), and with no graph the
+    backward pass raises 'element 0 of tensors does not require grad'. Leaving
+    the graph intact costs one backward per minibatch (the same cost as real
+    training) but an Adam step with lr=0 cannot change a single value.
+
+    lr must be zeroed AFTER the checkpoint load (optimizer.load_state_dict
+    restores the saved param_group lrs) and the adaptive-KL floor has to go too,
+    otherwise ppo.py re-raises lr to min_learning_rate on a KL spike.
+
+    `skip` names optimisers that must keep learning. --depth_rl passes
+    'depth_rl_optimizer': there the whole point of the run is the PPO update of
+    depth_actor, and freezing it would silently degrade to an evaluation.
+    """
+    alg = runner.alg
+    for name, opt in _optimizers(alg):
+        if name in skip:
+            continue
+        for group in opt.param_groups:
+            group['lr'] = 0.0
+    # PPO's adaptive-KL schedule reads/writes this trio every minibatch. The
+    # depth-RL schedule owns a separate trio (depth_rl_learning_rate/...), so
+    # zeroing these does not stop the depth student when it is skipped above.
+    for attr in ('learning_rate', 'min_learning_rate', 'max_learning_rate'):
+        if getattr(alg, attr, None) is not None:
+            setattr(alg, attr, 0.0)
+    lrs = {}
+    for name, opt in _optimizers(alg):
+        values = sorted({round(float(g['lr']), 12) for g in opt.param_groups})
+        lrs[name] = f"KEPT {values}" if name in skip else values
+    print(f"[train] --freeze: optimiser_lrs={lrs} "
+          f"adaptive_floor={getattr(alg, 'min_learning_rate', None)} "
+          f"requires_grad_kept=True (lr=0 makes every step a no-op)")
+
+
+def policy_fingerprint(runner, attrs=_FINGERPRINT_ATTRS):
+    """sha1 over every parameter AND buffer of every policy module."""
+    digest = hashlib.sha1()
+    for attr in attrs:
+        module = getattr(runner.alg, attr, None)
+        if module is None:
+            continue
+        for name, tensor in sorted(module.state_dict().items()):
+            digest.update(f"{attr}.{name}".encode())
+            digest.update(tensor.detach().to('cpu').contiguous().numpy().tobytes())
+    return digest.hexdigest()
 
 
 
@@ -182,6 +265,15 @@ def train(args):
             "(matches the 16 ms proprio pad enforced on hardware).")
     env_cfg.terrain.log_dir = log_pth
     env_cfg.terrain.save_vts = args.save_vts
+    if getattr(args, 'min_terrain_level', None) is not None:
+        # The curriculum is left LIVE (unlike --level, which locks a row): only the
+        # initial draw is floored, so promote/demote keep running. This is the single
+        # terrain knob go2_student takes from the distillation flow (min_terrain_level=4).
+        env_cfg.terrain.min_terrain_level = int(args.min_terrain_level)
+        print(f"[train] --min_terrain_level: initial levels drawn from "
+              f"U{{{env_cfg.terrain.min_terrain_level}.."
+              f"{max(env_cfg.terrain.min_terrain_level, env_cfg.terrain.max_init_terrain_level)}}} "
+              f"(max_init_terrain_level={env_cfg.terrain.max_init_terrain_level}), curriculum live")
     if args.save_vts_full_res:
         env_cfg.terrain.vts_export_cell_size = env_cfg.terrain.horizontal_scale
     if args.terrain_only is not None:
@@ -235,7 +327,43 @@ def train(args):
     print("Configuration printed!")
 
     ppo_runner, train_cfg = task_registry.make_alg_runner(log_root = log_pth, env=env, name=args.task, args=args)
+    fp_before = None
+    fp_attrs = _FINGERPRINT_ATTRS
+    depth_rl = bool(getattr(ppo_runner.alg, 'depth_rl_mode', False))
+    if getattr(args, 'freeze', False):
+        # On the depth-RL path the frozen set is ONLY the teacher actor: depth_actor
+        # (surrogate), the depth ENCODER (joint: replayed inside the PPO graph), the
+        # privileged critic (value loss), the estimator (true-state regression) and
+        # the history encoder (update_dagger regression) must all keep learning.
+        skip = ('depth_rl_optimizer', 'critic_optimizer', 'estimator_optimizer',
+                'depth_hist_encoder_optimizer') if depth_rl else ()
+        if depth_rl:
+            # No module is expected to stay bit-identical any more: the encoder now
+            # trains jointly and actor_critic holds BOTH the frozen teacher actor and
+            # the trainable critic, which a module-level fingerprint cannot separate.
+            # Skip the check and rely on the optimiser-lr table above instead.
+            fp_attrs = ()
+        freeze_policy(ppo_runner, skip=skip)
+        if fp_attrs:
+            fp_before = policy_fingerprint(ppo_runner, fp_attrs)
+            print(f"[train] --freeze: fp_before={fp_before} scope={fp_attrs}")
+        elif depth_rl:
+            print("[train] --freeze: no weight fingerprint on the depth-RL path "
+                  "(teacher actor and critic share the actor_critic module); the "
+                  "optimiser-lr table above is the check: depth_rl/critic/estimator/"
+                  "hist_encoder KEPT, the rest pinned at 0.0.")
     ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
+    if fp_before is not None:
+        fp_after = policy_fingerprint(ppo_runner, fp_attrs)
+        print(f"[train] --freeze: fp_after ={fp_after}")
+        frozen = "IDENTICAL (no weight moved)" if fp_after == fp_before else "CHANGED -- NOT FROZEN"
+        print(f"[train] --freeze VERDICT ({'depth_encoder only' if depth_rl else 'all modules'}): "
+              + frozen)
+        if depth_rl:
+            print("[train] --depth_rl: depth_actor (surrogate), depth_encoder (joint, "
+                  "replayed in-graph), critic (value loss), estimator (true-state "
+                  "regression) and history_encoder (update_dagger regression) are "
+                  "trained on purpose; only the teacher actor is frozen.")
 
 
 
